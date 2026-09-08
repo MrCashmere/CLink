@@ -1,0 +1,8 @@
+{
+  "name": "cashmere-link",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@ohos/hypium": "1.0.21"
+  }
+}

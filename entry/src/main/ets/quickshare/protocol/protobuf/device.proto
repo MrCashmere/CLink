@@ -1,0 +1,3 @@
+syntax = "proto3";
+package quickshare;
+message Device { string endpoint_id = 1; string name = 2; uint32 capabilities = 3; }

@@ -1,0 +1,15 @@
+{
+  "modelVersion": "6.1.1",
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "羊绒互传入口模块",
+  "main": "",
+  "author": "",
+  "license": "GPL-3.0",
+  "dependencies": {
+    "gsproto": "file:../gs"
+  },
+  "devDependencies": {
+    "@ohos/hypium": "1.0.21"
+  }
+}

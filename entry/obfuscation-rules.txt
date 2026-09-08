@@ -1,0 +1,2 @@
+-enable-property-obfuscation
+-enable-toplevel-obfuscation

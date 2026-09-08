@@ -1,0 +1,10 @@
+{
+  "modelVersion": "6.1.1",
+  "name": "cashmere-link",
+  "version": "1.0.0",
+  "description": "Nearby transfer application",
+  "main": "",
+  "author": "",
+  "license": "GPL-3.0",
+  "dependencies": {}
+}

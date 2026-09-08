@@ -1,0 +1,3 @@
+syntax = "proto3";
+package quickshare;
+message Frame { uint32 type = 1; bytes payload = 2; }

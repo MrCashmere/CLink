@@ -1,0 +1,15 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "羊绒互传主模块" },
+    { "name": "ability_desc", "value": "羊绒互传入口能力" },
+    { "name": "service_desc", "value": "Nearby discovery and receive service" },
+    { "name": "permission_internet", "value": "用于局域网本地传输。" },
+    { "name": "permission_network_info", "value": "用于显示本地传输地址。" },
+    { "name": "permission_wifi", "value": "用于创建 Wi-Fi 直连传输。" },
+    { "name": "permission_location", "value": "系统要求的定位权限，用于附近设备发现。" },
+    { "name": "permission_bluetooth", "value": "用于发现附近兼容设备。" },
+    { "name": "permission_background", "value": "让接收服务在后台持续运行。" },
+    { "name": "permission_bundle", "value": "用于标识本应用。" },
+    { "name": "permission_keep_background_running", "value": "用于通过长时任务在后台持续接收文件。" }
+  ]
+}

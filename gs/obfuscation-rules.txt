@@ -1,0 +1,1 @@
+# Obfuscation is disabled for the gs module (see build-profile.json5).

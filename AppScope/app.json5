@@ -1,0 +1,10 @@
+{
+  "app": {
+    "bundleName": "com.cashmere.link",
+    "vendor": "Cashmere",
+    "versionCode": 1000007,
+    "versionName": "1.0.0.7",
+    "icon": "$media:app_icon",
+    "label": "$string:app_name"
+  }
+}
