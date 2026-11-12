@@ -11,15 +11,25 @@ import { FilePickerHelper } from '../common/FilePickerHelper';
 import { IncomingFile, OutgoingFile, TransferEvent, WebShareInfo } from '../model/TransferModels';
 import { IconCircleButton } from '../components/IconCircleButton';
 import { AppBackground } from '../components/AppBackground';
-import { HwColor, HwRadius, HwSpace, hwTextPrimary, hwTextSecondary, hwPrimary, hwPrimaryButton, hwOnline, hwDanger, hwGlassSurface, hwGlassBorder } from '../utils/DesignTokens';
-import { isApi26OrAbove, immersiveMaterialModifier, legacyMaterialModifier } from '../utils/SystemMaterial';
+import { HwColor, HwRadius, HwSpace, hwTextPrimary, hwTextSecondary, hwPrimary, hwPrimaryButton, hwSurface, hwOnline, hwDanger, hwGlassBorder, reloadAppTheme, resolvePageBackground, onAccentColor, topBarGlassColor, resolvePrimaryColor, resolvePrimaryButtonColor } from '../utils/DesignTokens';
+import { cardGlassEffect, toastSystemMaterial, cardGlassBorderColor, cardGlassShadow } from '../utils/SystemMaterial';
+import { CardSurface } from '../components/CardSurface';
+import { AccentColorSentinel } from '../components/MaterialCard';
 
 @Entry
 @Component
 struct LanWebTransferPage {
+  /** 主题色变化时触发重建，让 HwColor.primary 与选中态取到新色值 */
+  @StorageProp('accentColor') @Watch('onAccentColorChanged') accentColor: string = '';
+  /** 页面底色（由 applyAppTheme 发布）。直接读 HwColor.background 登记不上依赖 */
+  @StorageProp('pageBackground') pageBackground: string = '';
   @StorageProp('statusBarHeight') statusBarHeight: number = 0;
   @StorageProp('isDarkMode') isDarkMode: boolean = false;
   @StorageLink('immersiveLightEnabled') immersiveLightEnabled: boolean = true;
+  @StorageLink('beautifulCards') beautifulCards: boolean = false;
+  @StorageLink('classicCards') classicCards: boolean = false;
+  @StorageLink('cardShadowBorder') cardShadowBorder: boolean = true;
+  @StorageLink('experimentalCards') experimentalCards: boolean = false;
   @StorageLink('fontMode') fontMode: string = 'system';
   @StorageLink('fontFamilyEn') fontFamilyEn: string = 'system';
   @StorageLink('fontFamilyZh') fontFamilyZh: string = 'system';
@@ -38,10 +48,16 @@ struct LanWebTransferPage {
     }
   };
 
+  /** 热点地址一探到就改写链接（本页没有定时刷新，全靠这个回调摆脱 10.x 蜂窝地址）。 */
+  private readonly hotspotAddressListener: (address: string) => void = (address: string): void => {
+    this.refreshLink();
+  };
+
   aboutToAppear(): void {
     const context = getContext(this) as common.UIAbilityContext;
     this.services = AppServices.get(context);
     this.services.transfer.addListener(this.transferListener);
+    this.services.onHotspotAddressChange(this.hotspotAddressListener);
     // 读取设备别名（用于网页端显示设备名）。
     SettingsStore.load(context).then((settings): void => {
       this.deviceName = settings.alias.length > 0 ? settings.alias : '羊绒互传';
@@ -53,6 +69,7 @@ struct LanWebTransferPage {
 
   aboutToDisappear(): void {
     this.services?.transfer.removeListener(this.transferListener);
+    this.services?.offHotspotAddressChange(this.hotspotAddressListener);
   }
 
   private appFontFamily(content: string): string {
@@ -88,20 +105,20 @@ struct LanWebTransferPage {
 
   private copyLink(): void {
     if (this.linkText.length === 0) {
-      promptAction.showToast({ message: '尚未获取到局域网地址，请检查网络', duration: 2000 });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '尚未获取到局域网地址，请检查网络', duration: 2000 });
       return;
     }
     try {
       const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.linkText);
       pasteboard.getSystemPasteboard().setData(data).then((): void => {
-        promptAction.showToast({ message: '链接已复制', duration: 1500 });
+        promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '链接已复制', duration: 1500 });
       }).catch((error: BusinessError): void => {
         Lg.w('LanWeb copy link failed: ' + error.message);
-        promptAction.showToast({ message: '复制失败：' + error.message, duration: 2000 });
+        promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '复制失败：' + error.message, duration: 2000 });
       });
     } catch (error) {
       Lg.w('LanWeb copy link error: ' + JSON.stringify(error));
-      promptAction.showToast({ message: '复制失败，请重试', duration: 2000 });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '复制失败，请重试', duration: 2000 });
     }
   }
 
@@ -142,10 +159,10 @@ struct LanWebTransferPage {
         this.services?.transfer.shareFileForWeb(file.path, file.name, file.size);
       }
       this.refreshSharedFiles();
-      promptAction.showToast({ message: '已开放 ' + files.length + ' 个文件供网页端下载', duration: 2000 });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '已开放 ' + files.length + ' 个文件供网页端下载', duration: 2000 });
     }).catch((error: BusinessError): void => {
       Lg.w('LanWeb pick share file failed: ' + error.message);
-      promptAction.showToast({ message: '选择文件失败：' + error.message, duration: 2000 });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '选择文件失败：' + error.message, duration: 2000 });
     });
   }
 
@@ -179,16 +196,28 @@ struct LanWebTransferPage {
         parameters: { 'ohos.aafwk.param.bundleName': 'com.cashmere.link' }
       }).catch((error: BusinessError): void => {
         Lg.e('LanWeb open file failed: ' + JSON.stringify(error));
-        promptAction.showToast({ message: '无法打开：' + (error.message ?? ''), duration: 2000 });
+        promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开：' + (error.message ?? ''), duration: 2000 });
       });
     } catch (error) {
       Lg.e('LanWeb open file error: ' + JSON.stringify(error));
-      promptAction.showToast({ message: '无法打开文件', duration: 2000 });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开文件', duration: 2000 });
     }
+  }
+
+  /** 主题色变了：HwColor 是模块级对象，改属性不会触发刷新，靠这里重建页面 */
+  onAccentColorChanged(): void {
+    reloadAppTheme();
+  }
+
+  /** 当前主题色。读 accentColor 建立依赖；直接写 HwColor.primary 切色后不会重新求值 */
+  private accentOrPrimary(): string {
+    return this.accentColor.length > 0 ? this.accentColor : HwColor.primary;
   }
 
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
+      // 主题色依赖：切色时让整页重新求值（零尺寸，不参与布局）
+      AccentColorSentinel()
       AppBackground()
       Column() {
         Scroll() {
@@ -216,229 +245,245 @@ struct LanWebTransferPage {
       .backgroundColor(Color.Transparent)
 
       Row() {
-        IconCircleButton({ symbol: $r('sys.symbol.chevron_left'), buttonSize: 40, iconSize: 20, onAction: (): void => router.back() })
+        IconCircleButton({ symbol: $r('sys.symbol.chevron_left'), glass: true, buttonSize: 40, iconSize: 20, onAction: (): void => router.back() })
         Text('局域网网页传输').fontSize(20).fontWeight(FontWeight.Bold).fontFamily(this.appFontFamily('局域网网页传输')).fontColor(hwTextPrimary(this.isDarkMode)).margin({ left: HwSpace.md })
         Blank()
       }
       .width('100%')
       .height(56 + this.statusBarHeight)
       .padding({ left: 16, right: 16, top: this.statusBarHeight })
-      .backgroundEffect({ radius: 12, color: '#66FFFFFF' })
+      .backgroundEffect({ radius: 12, color: topBarGlassColor(this.isDarkMode) })
     }
     .width('100%')
     .height('100%')
-    .backgroundColor(this.isDarkMode ? HwColor.backgroundDark : HwColor.background)
+    .backgroundColor(resolvePageBackground(this.isDarkMode, this.pageBackground))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
   @Builder
   linkCard() {
-    Column({ space: 10 }) {
-      Text('局域网访问链接')
-        .fontSize(12)
-        .fontFamily(this.appFontFamily('局域网访问链接'))
-        .fontWeight(this.appFontWeight())
-        .fontColor(hwTextSecondary(this.isDarkMode))
-        .width('100%')
-      if (this.addressEmpty) {
-        Text('未获取到局域网地址，请确认已连接 Wi-Fi 并重试')
-          .fontSize(15)
-          .fontFamily(this.appFontFamily('未获取到局域网地址，请确认已连接 Wi-Fi 并重试'))
+    CardSurface({ radius: HwRadius.card }) {
+      Column({ space: 10 }) {
+        Text('局域网访问链接')
+          .fontSize(12)
+          .fontFamily(this.appFontFamily('局域网访问链接'))
           .fontWeight(this.appFontWeight())
-          .fontColor(hwTextPrimary(this.isDarkMode))
+          .fontColor(hwTextSecondary(this.isDarkMode))
           .width('100%')
-      } else {
-        Row({ space: 10 }) {
-          Text(this.linkText)
+        if (this.addressEmpty) {
+          Text('未获取到局域网地址，请确认已连接 Wi-Fi 并重试')
             .fontSize(15)
-            .fontFamily(this.appFontFamily(this.linkText))
+            .fontFamily(this.appFontFamily('未获取到局域网地址，请确认已连接 Wi-Fi 并重试'))
             .fontWeight(this.appFontWeight())
-            .fontColor(hwPrimary(this.isDarkMode))
-            .layoutWeight(1)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Button('复制', { type: ButtonType.Capsule })
-            .height(34)
-            .fontSize(13)
-            .fontFamily(this.appFontFamily('复制'))
-            .fontColor(Color.White)
-            .padding({ left: 16, right: 16 })
-            .backgroundColor(hwPrimaryButton(this.isDarkMode))
-            .onClick(() => this.copyLink())
+            .fontColor(hwTextPrimary(this.isDarkMode))
+            .width('100%')
+        } else {
+          Row({ space: 10 }) {
+            Text(this.linkText)
+              .fontSize(15)
+              .fontFamily(this.appFontFamily(this.linkText))
+              .fontWeight(this.appFontWeight())
+              .fontColor(resolvePrimaryColor(this.isDarkMode, this.accentOrPrimary()))
+              .layoutWeight(1)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            Button('复制', { type: ButtonType.Capsule })
+              .height(34)
+              .fontSize(13)
+              .fontFamily(this.appFontFamily('复制'))
+              .fontColor(onAccentColor(this.accentOrPrimary()))
+              .padding({ left: 16, right: 16 })
+              .backgroundColor(resolvePrimaryButtonColor(this.isDarkMode, this.accentOrPrimary()))
+              .onClick(() => this.copyLink())
+          }
+          .width('100%')
         }
-        .width('100%')
       }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
   }
 
   @Builder
   shareCard() {
-    Column({ space: 10 }) {
-      Row({ space: 12 }) {
-        IconCircleButton({ symbol: $r('sys.symbol.share'), buttonSize: 40, iconSize: 19 })
-        Column({ space: 2 }) {
-          Text('发送文件到网页端')
+    CardSurface({ radius: HwRadius.card }) {
+      Column({ space: 10 }) {
+        Row({ space: 12 }) {
+          IconCircleButton({ symbol: $r('sys.symbol.share'), buttonSize: 40, iconSize: 19 })
+          Column({ space: 2 }) {
+            Text('发送文件到网页端')
+              .fontSize(16)
+              .fontWeight(FontWeight.Medium)
+              .fontFamily(this.appFontFamily('发送文件到网页端'))
+              .fontColor(hwTextPrimary(this.isDarkMode))
+            Text('选择本机文件后，网页端可下载')
+              .fontSize(12)
+              .fontColor(hwTextSecondary(this.isDarkMode))
+              .fontFamily(this.appFontFamily('选择本机文件后，网页端可下载'))
+              .fontWeight(this.appFontWeight())
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+          SymbolGlyph($r('sys.symbol.chevron_right'))
             .fontSize(16)
-            .fontWeight(FontWeight.Medium)
-            .fontFamily(this.appFontFamily('发送文件到网页端'))
-            .fontColor(hwTextPrimary(this.isDarkMode))
-          Text('选择本机文件后，网页端可下载')
-            .fontSize(12)
-            .fontColor(hwTextSecondary(this.isDarkMode))
-            .fontFamily(this.appFontFamily('选择本机文件后，网页端可下载'))
-            .fontWeight(this.appFontWeight())
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-        SymbolGlyph($r('sys.symbol.chevron_right'))
-          .fontSize(16)
-          .fontColor([hwTextSecondary(this.isDarkMode)])
-      }
-      .width('100%')
-      .onClick(() => this.pickShareFiles())
-
-      if (this.sharedFiles.length > 0) {
-        Column({ space: 6 }) {
-          ForEach(this.sharedFiles, (file: WebShareInfo): void => {
-            Row({ space: 8 }) {
-              Text(file.name).layoutWeight(1).fontSize(13).fontFamily(this.appFontFamily(file.name)).fontWeight(this.appFontWeight()).fontColor(hwTextPrimary(this.isDarkMode))
-                .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-              Text(this.fileSizeText(file.size)).fontSize(12).fontFamily(this.appFontFamily(this.fileSizeText(file.size))).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
-              Button('停止', { type: ButtonType.Capsule }).height(26).fontSize(12).fontFamily(this.appFontFamily('停止'))
-                .backgroundColor(HwColor.background)
-                .fontColor(hwTextSecondary(this.isDarkMode))
-                .onClick(() => this.removeShare(file.id))
-            }.width('100%')
-          }, (file: WebShareInfo): string => file.id)
+            .fontColor([hwTextSecondary(this.isDarkMode)])
         }
         .width('100%')
-        .padding({ top: 4 })
-      } else {
-        Text('尚未选择文件。点击上方选择要共享给网页端下载的文件。')
-          .fontSize(12)
-          .fontColor(hwTextSecondary(this.isDarkMode))
-          .fontFamily(this.appFontFamily('尚未选择文件。点击上方选择要共享给网页端下载的文件。'))
-          .fontWeight(this.appFontWeight())
+        .onClick(() => this.pickShareFiles())
+
+        if (this.sharedFiles.length > 0) {
+          Column({ space: 6 }) {
+            ForEach(this.sharedFiles, (file: WebShareInfo): void => {
+              Row({ space: 8 }) {
+                Text(file.name).layoutWeight(1).fontSize(13).fontFamily(this.appFontFamily(file.name)).fontWeight(this.appFontWeight()).fontColor(hwTextPrimary(this.isDarkMode))
+                  .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                Text(this.fileSizeText(file.size)).fontSize(12).fontFamily(this.appFontFamily(this.fileSizeText(file.size))).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
+                Button('停止', { type: ButtonType.Capsule }).height(26).fontSize(12).fontFamily(this.appFontFamily('停止'))
+                  // 中性底：这是「次级按钮」，不该跟着主题色走，也不能直接读模块级 HwColor
+                  .backgroundColor(hwSurface(this.isDarkMode))
+                  .fontColor(hwTextSecondary(this.isDarkMode))
+                  .onClick(() => this.removeShare(file.id))
+              }.width('100%')
+            }, (file: WebShareInfo): string => file.id + ':' + this.accentColor)
+          }
           .width('100%')
+          .padding({ top: 4 })
+        } else {
+          Text('尚未选择文件。点击上方选择要共享给网页端下载的文件。')
+            .fontSize(12)
+            .fontColor(hwTextSecondary(this.isDarkMode))
+            .fontFamily(this.appFontFamily('尚未选择文件。点击上方选择要共享给网页端下载的文件。'))
+            .fontWeight(this.appFontWeight())
+            .width('100%')
+        }
       }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
   }
 
   @Builder
   statusCard() {
-    Row({ space: 12 }) {
-      IconCircleButton({ symbol: $r('sys.symbol.wifi'), buttonSize: 40, iconSize: 19 })
-      Column({ space: 2 }) {
-        Text(this.deviceName)
-          .fontSize(16)
-          .fontWeight(FontWeight.Medium)
-          .fontFamily(this.appFontFamily(this.deviceName))
-          .fontColor(hwTextPrimary(this.isDarkMode))
-        Text('等待对端浏览器通过链接发送文件')
+    CardSurface({ radius: HwRadius.card }) {
+      Row({ space: 12 }) {
+        IconCircleButton({ symbol: $r('sys.symbol.wifi'), buttonSize: 40, iconSize: 19 })
+        Column({ space: 2 }) {
+          Text(this.deviceName)
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontFamily(this.appFontFamily(this.deviceName))
+            .fontColor(hwTextPrimary(this.isDarkMode))
+          Text('等待对端浏览器通过链接发送文件')
+            .fontSize(12)
+            .fontColor(hwTextSecondary(this.isDarkMode))
+            .fontFamily(this.appFontFamily('等待对端浏览器通过链接发送文件'))
+            .fontWeight(this.appFontWeight())
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+        Text('接收中')
           .fontSize(12)
-          .fontColor(hwTextSecondary(this.isDarkMode))
-          .fontFamily(this.appFontFamily('等待对端浏览器通过链接发送文件'))
+          .fontColor(hwOnline(this.isDarkMode))
+          .fontFamily(this.appFontFamily('接收中'))
           .fontWeight(this.appFontWeight())
       }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-      Text('接收中')
-        .fontSize(12)
-        .fontColor(hwOnline(this.isDarkMode))
-        .fontFamily(this.appFontFamily('接收中'))
-        .fontWeight(this.appFontWeight())
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
   }
 
   @Builder
   howToCard() {
-    Column({ space: 6 }) {
-      Text('使用说明')
-        .fontSize(15)
-        .fontWeight(FontWeight.Medium)
-        .fontFamily(this.appFontFamily('使用说明'))
-        .fontColor(hwTextPrimary(this.isDarkMode))
-        .width('100%')
-      Text('1. 在「同一局域网」内的电脑/手机上打开上面的链接。')
-        .fontSize(13)
-        .fontColor(hwTextSecondary(this.isDarkMode))
-        .fontFamily(this.appFontFamily('1. 在「同一局域网」内的电脑/手机上打开上面的链接。'))
-        .fontWeight(this.appFontWeight())
-        .width('100%')
-      Text('2. 在对端浏览器内选择文件（可多选），点击「发送到本机」。')
-        .fontSize(13)
-        .fontColor(hwTextSecondary(this.isDarkMode))
-        .fontFamily(this.appFontFamily('2. 在对端浏览器内选择文件（可多选），点击「发送到本机」。'))
-        .fontWeight(this.appFontWeight())
-        .width('100%')
-      Text('3. 保持本应用在前台，收到请求后点击「确认」即可接收。')
-        .fontSize(13)
-        .fontColor(hwTextSecondary(this.isDarkMode))
-        .fontFamily(this.appFontFamily('3. 保持本应用在前台，收到请求后点击「确认」即可接收。'))
-        .fontWeight(this.appFontWeight())
-        .width('100%')
-      Text('4. 请不要使用本机热点作为局域网，否则对端无法打开网页')
-        .fontSize(13)
-        .fontColor(hwDanger(this.isDarkMode))
-        .fontFamily(this.appFontFamily('4. 请不要使用本机热点作为局域网，否则对端无法打开网页'))
-        .fontWeight(FontWeight.Bold)
-        .width('100%')
+    CardSurface({ radius: HwRadius.card }) {
+      Column({ space: 6 }) {
+        Text('使用说明')
+          .fontSize(15)
+          .fontWeight(FontWeight.Medium)
+          .fontFamily(this.appFontFamily('使用说明'))
+          .fontColor(hwTextPrimary(this.isDarkMode))
+          .width('100%')
+        Text('1. 在「同一局域网」内的电脑/手机上打开上面的链接。')
+          .fontSize(13)
+          .fontColor(hwTextSecondary(this.isDarkMode))
+          .fontFamily(this.appFontFamily('1. 在「同一局域网」内的电脑/手机上打开上面的链接。'))
+          .fontWeight(this.appFontWeight())
+          .width('100%')
+        Text('2. 在对端浏览器内选择文件（可多选），点击「发送到本机」。')
+          .fontSize(13)
+          .fontColor(hwTextSecondary(this.isDarkMode))
+          .fontFamily(this.appFontFamily('2. 在对端浏览器内选择文件（可多选），点击「发送到本机」。'))
+          .fontWeight(this.appFontWeight())
+          .width('100%')
+        Text('3. 保持本应用在前台，收到请求后点击「确认」即可接收。')
+          .fontSize(13)
+          .fontColor(hwTextSecondary(this.isDarkMode))
+          .fontFamily(this.appFontFamily('3. 保持本应用在前台，收到请求后点击「确认」即可接收。'))
+          .fontWeight(this.appFontWeight())
+          .width('100%')
+        Text('4. 安装了 VMware 的 Windows 电脑可能会因为 IP 冲突无法使用热点连接到本设备的局域网网页')
+          .fontSize(13)
+          .fontColor(hwDanger(this.isDarkMode))
+          .fontFamily(this.appFontFamily('4. 安装了 VMware 的 Windows 电脑可能会因为 IP 冲突无法使用热点连接到本设备的局域网网页'))
+          .fontWeight(FontWeight.Bold)
+          .width('100%')
+      }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
   }
 
   @Builder
   receivedFilesCard() {
-    Column({ space: 6 }) {
-      Text('已接收 ' + this.receivedFiles.length + ' 个文件').fontSize(14).fontWeight(FontWeight.Medium).fontFamily(this.appFontFamily('已接收 个文件')).fontColor(hwTextPrimary(this.isDarkMode))
-      ForEach(this.receivedFiles, (file: IncomingFile): void => {
-        Column({ space: 4 }) {
-          Row({ space: 8 }) {
-            Text(file.name).layoutWeight(1).fontSize(13).fontFamily(this.appFontFamily(file.name)).fontWeight(this.appFontWeight()).fontColor(hwTextPrimary(this.isDarkMode))
-              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-            Text(this.fileSizeText(file.size)).fontSize(12).fontFamily(this.appFontFamily(this.fileSizeText(file.size))).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
-            Button('打开', { type: ButtonType.Capsule }).height(26).fontSize(12).fontFamily(this.appFontFamily('打开'))
-              .backgroundColor(hwPrimaryButton(this.isDarkMode)).fontColor(Color.White)
-              .onClick(() => this.openFile(file))
+    CardSurface({ radius: HwRadius.card }) {
+      Column({ space: 6 }) {
+        Text('已接收 ' + this.receivedFiles.length + ' 个文件').fontSize(14).fontWeight(FontWeight.Medium).fontFamily(this.appFontFamily('已接收 个文件')).fontColor(hwTextPrimary(this.isDarkMode))
+        ForEach(this.receivedFiles, (file: IncomingFile): void => {
+          Column({ space: 4 }) {
+            Row({ space: 8 }) {
+              Text(file.name).layoutWeight(1).fontSize(13).fontFamily(this.appFontFamily(file.name)).fontWeight(this.appFontWeight()).fontColor(hwTextPrimary(this.isDarkMode))
+                .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text(this.fileSizeText(file.size)).fontSize(12).fontFamily(this.appFontFamily(this.fileSizeText(file.size))).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
+              Button('打开', { type: ButtonType.Capsule }).height(26).fontSize(12).fontFamily(this.appFontFamily('打开'))
+                .backgroundColor(resolvePrimaryButtonColor(this.isDarkMode, this.accentOrPrimary())).fontColor(onAccentColor(this.accentOrPrimary()))
+                .onClick(() => this.openFile(file))
+            }.width('100%')
+            Text(file.savedPath).fontSize(11).fontFamily(this.appFontFamily(file.savedPath)).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
+              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
           }.width('100%')
-          Text(file.savedPath).fontSize(11).fontFamily(this.appFontFamily(file.savedPath)).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
-            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
-        }.width('100%')
-      }, (file: IncomingFile): string => file.savedPath + ':' + file.name)
+        }, (file: IncomingFile): string => file.savedPath + ':' + file.name + ':' + this.accentColor)
+      }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
   }
 }

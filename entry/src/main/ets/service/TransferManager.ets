@@ -16,6 +16,9 @@ import {
   WebShareInfo
 } from '../model/TransferModels';
 import { LocalSendClient, SendHooks } from '../protocol/localsend/LocalSendClient';
+import { DynamicPhotoService, IncomingFileLike } from '../common/DynamicPhotoService';
+import { GalleryAutoSaveService } from '../quickshare/service/GalleryAutoSaveService';
+import { PeerDecision } from '../common/PeerLivePhotoFormat';
 import {
   IncomingSessionRequest,
   LocalSendIncomingHandler,
@@ -46,13 +49,18 @@ export class TransferManager implements LocalSendIncomingHandler {
   private readonly tasks: Map<string, TransferTask> = new Map();
   private readonly sessionTasks: Map<string, string> = new Map();
   private readonly pinEntryResolvers: Map<string, (pin: string | null) => void> = new Map();
+  private readonly pinEntryTimers: Map<string, number> = new Map();
   private readonly listeners: Set<TransferListener> = new Set();
   private readonly progressLogBuckets: Map<string, number> = new Map();
   private readonly activeReceiveKeys: Map<ProtocolKind, string> = new Map();
   private readonly protocolFacades: Map<'quickshare' | 'windowsnearby', GsFacade> = new Map();
+  /** 已在沙箱阶段处理过的接收文件（key 见 stageKey），避免搬到下载目录后再白跑一次解析。 */
+  private readonly stagedKeys: Set<string> = new Set();
   private localsendServer?: LocalSendServer;
   private cleanupTimer: number = -1;
   private started = false;
+  private serverStart?: Promise<void>;
+  private serverGeneration: number = 0;
 
   private readonly context: common.Context;
   private readonly certs: CertificateStore;
@@ -94,22 +102,48 @@ export class TransferManager implements LocalSendIncomingHandler {
   }
 
   async startServer(): Promise<void> {
+    const requestedGeneration = this.serverGeneration;
+    while (this.serverStart !== undefined) {
+      await this.serverStart;
+      if (requestedGeneration !== this.serverGeneration && !this.started) { return; }
+    }
     if (this.started) {
       return;
     }
-    this.started = true;
-    this.localsendServer = new LocalSendServer(this.context);
-    this.localsendServer.setHandler(this);
-    await this.localsendServer.start();
-    // Quick Share/Windows Nearby 接收由各自独立页面负责，不再由全局服务占用端口。
-    this.startCleanupTimer();
+    const generation: number = ++this.serverGeneration;
+    const server: LocalSendServer = new LocalSendServer(this.context);
+    this.localsendServer = server;
+    server.setHandler(this);
+    const operation: Promise<void> = server.start();
+    this.serverStart = operation;
+    try {
+      await operation;
+      if (generation !== this.serverGeneration) {
+        server.stop();
+        return;
+      }
+      this.started = true;
+      this.startCleanupTimer();
+    } catch (error) {
+      server.stop();
+      if (this.localsendServer === server) {
+        this.localsendServer = undefined;
+        this.started = false;
+      }
+      throw error as Error;
+    } finally {
+      if (this.serverStart === operation) {
+        this.serverStart = undefined;
+      }
+    }
   }
 
   stopServer(): void {
-    if (!this.started) {
-      return;
-    }
+    this.serverGeneration += 1;
     this.started = false;
+    for (const id of Array.from(this.pinEntryResolvers.keys())) {
+      this.submitPinEntry(id, null);
+    }
     this.stopCleanupTimer();
     this.localsendServer?.stop();
     this.localsendServer = undefined;
@@ -147,18 +181,22 @@ export class TransferManager implements LocalSendIncomingHandler {
     };
     task.state = 'running';
     try {
+      // 动态图片传输(Beta)：按**对端平台**决定封装格式 —— Apple 实况照片 / Android 标准动态照片 /
+      // 「图片 + 视频」拆分；认不出对端时用设置里的「默认通用动态图片格式」。
+      const decision: PeerDecision = DynamicPhotoService.resolveFormatFor(device);
+      const effectiveFiles: OutgoingFile[] = await DynamicPhotoService.prepareOutgoing(this.context, files, decision);
       if (device.protocol === 'localsend') {
         const hooks: SendHooks = {
           onProgress: onProgress,
           onPinRequired: (): Promise<string | null> => this.requestPinEntry(task.id)
         };
-        await new LocalSendClient(this.context).send(device, files, hooks);
+        await new LocalSendClient(this.context).send(device, effectiveFiles, hooks);
       } else if (device.protocol === 'quickshare') {
         const hooks: GsSendHooks = { onPin: onPin, onProgress: onProgress };
-        await this.facadeFor('quickshare').send(device, files, hooks);
+        await this.facadeFor('quickshare').send(device, effectiveFiles, hooks);
       } else {
         const hooks: GsSendHooks = { onPin: onPin, onProgress: onProgress };
-        await this.facadeFor('windowsnearby').send(device, files, hooks);
+        await this.facadeFor('windowsnearby').send(device, effectiveFiles, hooks);
       }
       task.state = 'completed';
       task.progress = 100;
@@ -234,9 +272,12 @@ export class TransferManager implements LocalSendIncomingHandler {
       return Promise.resolve(null);
     }
     task.state = 'awaiting-pin';
-    this.emit('pin-entry', task);
     return new Promise<string | null>((resolve: (pin: string | null) => void): void => {
       this.pinEntryResolvers.set(taskId, resolve);
+      this.pinEntryTimers.set(taskId, setTimeout((): void => {
+        this.submitPinEntry(taskId, null);
+      }, 90000));
+      this.emit('pin-entry', task);
     });
   }
 
@@ -247,6 +288,11 @@ export class TransferManager implements LocalSendIncomingHandler {
       return false;
     }
     this.pinEntryResolvers.delete(taskId);
+    const timer: number | undefined = this.pinEntryTimers.get(taskId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.pinEntryTimers.delete(taskId);
+    }
     resolver(entered);
     return true;
   }
@@ -375,10 +421,103 @@ export class TransferManager implements LocalSendIncomingHandler {
   onFileReceived(sessionId: string, file: IncomingFile): void {
     Lg.i('羊绒互传 receive: file saved ' + file.name + ' (' + file.size + ' bytes) -> ' + file.savedPath);
     this.emitIncomingFile(sessionId, file);
+    this.settleDynamicPhoto(sessionId, file);
+  }
+
+  /**
+   * 文件刚落到应用沙箱、还没被搬到下载目录时调用（见 LocalSendIncomingHandler.onFileStaged）。
+   *
+   * 动态图片必须在这一刻处理：搬运到下载目录后沙箱副本会被删除，而下载目录路径应用没有
+   * 读权限，之后再想解析原文件就已经读不到字节了（这正是此前「接收到的动图没有变成鸿蒙
+   * 动态照片」的直接原因之一）。
+   */
+  async onFileStaged(sessionId: string, file: IncomingFile): Promise<void> {
+    // 不论动态图片开关是否打开，都要记录“这个文件在沙箱阶段处理过”，
+    // 防止 onFileReceived 在文件搬走后重复解析。
+    this.stagedKeys.add(TransferManager.stageKey(sessionId, file.name, file.size));
+    const self: IncomingFileLike = TransferManager.toDynamicFile(file);
+    const task = this.taskForSession(sessionId);
+    const batch: IncomingFileLike[] = (task !== undefined ? task.receivedFiles : []).map(
+      (item: IncomingFile): IncomingFileLike => TransferManager.toDynamicFile(item));
+    batch.push(self);
+
+    // HDR 与动态照片开关独立；始终在文件搬出沙箱前逐项处理。
+    await DynamicPhotoService.settleReceivedFile(this.context, self, batch, 'localsend:' + sessionId);
+
+    if (GalleryAutoSaveService.enabled()
+      && !DynamicPhotoService.isClaimedByDynamicPhoto(self.savedPath)) {
+      const result = await GalleryAutoSaveService.saveStaged(
+        this.context, self.savedPath, file.name, file.size, file.mime ?? '');
+      Lg.i('[GALLERY] staged save handled=' + result.handled
+        + ' gallery=' + result.savedToGallery
+        + ' name=' + file.name
+        + ' uri=' + result.assetUri
+        + ' error=' + result.error);
+    } else if (DynamicPhotoService.isClaimedByDynamicPhoto(self.savedPath)) {
+      Lg.i('[GALLERY] staged skipped (dynamic photo claims file): ' + file.name);
+    }
+  }
+
+  /**
+   * 动态图片传输(Beta)：文件落盘后尝试把它（及其配对视频）还原成鸿蒙动态照片。
+   * 不阻塞接收流程（异步执行，失败只记日志）。
+   */
+  private settleDynamicPhoto(sessionId: string, file: IncomingFile): void {
+    if (!DynamicPhotoService.enabled()) {
+      return;
+    }
+    if (this.stagedKeys.has(TransferManager.stageKey(sessionId, file.name, file.size))) {
+      // 这个文件在落盘时已经（在沙箱内）处理过了：下载目录里的副本读不了，不必重来。
+      Lg.i('[DYNAMIC] already staged, skip post-relocate settle: ' + file.name);
+      return;
+    }
+    const task = this.taskForSession(sessionId);
+    const batch: IncomingFile[] = task !== undefined ? task.receivedFiles.concat([file]) : [file];
+    const files: IncomingFileLike[] = batch.map((item: IncomingFile): IncomingFileLike =>
+      TransferManager.toDynamicFile(item));
+    const self: IncomingFileLike = TransferManager.toDynamicFile(file);
+    Lg.i('[DYNAMIC] settle after save: ' + file.name + ' path=' + self.savedPath);
+    DynamicPhotoService.settleReceivedFile(this.context, self, files, 'localsend:' + sessionId).catch((error: Error): void => {
+      Lg.w('[DYNAMIC] settle (localsend) failed: ' + error.message);
+    });
+  }
+
+  /** 优先用沙箱内的原始路径（下载目录里的副本应用读不了）。 */
+  private static toDynamicFile(file: IncomingFile): IncomingFileLike {
+    const local = file.localPath !== undefined ? file.localPath : '';
+    return {
+      name: file.name,
+      size: file.size,
+      savedPath: local.length > 0 ? local : file.savedPath
+    };
+  }
+
+  private static stageKey(sessionId: string, name: string, size: number): string {
+    return sessionId + '|' + name + '|' + size;
+  }
+
+  /** 会话结束（进度到 100 或任务终态）时给等待配对的动态图片最后一次机会。 */
+  static settleDynamicBatch(context: common.Context, files: IncomingFile[], scope: string): void {
+    if (!DynamicPhotoService.enabled() || files.length === 0) {
+      return;
+    }
+    const batch: IncomingFileLike[] = files.map((item: IncomingFile): IncomingFileLike =>
+      TransferManager.toDynamicFile(item));
+    DynamicPhotoService.settleBatch(context, batch, scope).catch((error: Error): void => {
+      Lg.w('[DYNAMIC] settleBatch failed: ' + error.message);
+    });
   }
 
   onProgress(sessionId: string, progress: number): void {
     this.emitReceiveProgress(sessionId, progress);
+  }
+
+  onSessionFailed(sessionId: string, error: string): void {
+    const task: TransferTask | undefined = this.taskForSession(sessionId);
+    if (task !== undefined) {
+      this.finishTask(task.id, false, error);
+      this.sessionTasks.delete(sessionId);
+    }
   }
 
   private buildGsReceiveHooks(kind: 'quickshare' | 'windowsnearby'): GsReceiveHooks {
@@ -388,9 +527,10 @@ export class TransferManager implements LocalSendIncomingHandler {
         manager.activeReceiveKeys.set(kind, key);
         return manager.registerIncomingTask(key, kind, peerName, files, pin);
       },
-      onFileReceived: (file: IncomingFile): void => {
+      onFileReceived: (file: IncomingFile): Promise<void> => {
         const key = manager.activeReceiveKeys.get(kind) ?? '';
         manager.emitIncomingFile(key, file);
+        return Promise.resolve();
       },
       onProgress: (percent: number): void => {
         const key = manager.activeReceiveKeys.get(kind) ?? '';
@@ -418,11 +558,17 @@ export class TransferManager implements LocalSendIncomingHandler {
     if (task !== undefined) {
       task.progress = percent;
       this.emit('progress', task);
-      if (percent >= 100) {
+      if (percent >= 100 && task.receivedFiles.length >= task.files.length) {
         task.state = 'completed';
         task.completedAt = Date.now();
         this.sessionTasks.delete(sessionKey);
         this.emit('completed', task);
+        // 动态图片传输(Beta)：会话结束，给「先到图片、后到视频」的配对最后一次机会。
+        TransferManager.settleDynamicBatch(this.context, task.receivedFiles, 'localsend:' + sessionKey);
+        const stagedPrefix = sessionKey + '|';
+        for (const key of Array.from(this.stagedKeys.keys())) {
+          if (key.startsWith(stagedPrefix)) { this.stagedKeys.delete(key); }
+        }
       }
     }
   }

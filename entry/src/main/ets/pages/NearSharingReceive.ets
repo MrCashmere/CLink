@@ -6,17 +6,29 @@ import promptAction from '@ohos.promptAction';
 import router from '@ohos.router';
 import { IconCircleButton } from '../components/IconCircleButton';
 import { AppBackground } from '../components/AppBackground';
-import { HwColor, HwRadius, HwSpace, hwTextPrimary, hwTextSecondary, hwPrimaryButton, hwGlassSurface, hwGlassBorder } from '../utils/DesignTokens';
-import { isApi26OrAbove, immersiveMaterialModifier, legacyMaterialModifier } from '../utils/SystemMaterial';
+import { HwColor, HwRadius, HwSpace, hwTextPrimary, hwTextSecondary, hwPrimaryButton, hwGlassBorder, reloadAppTheme, resolvePageBackground, onAccentColor, topBarGlassColor, resolvePrimaryButtonColor } from '../utils/DesignTokens';
+import { cardGlassEffect, toastSystemMaterial, dialogSystemMaterial, cardGlassBorderColor, cardGlassShadow } from '../utils/SystemMaterial';
 import { IncomingFile, SessionFileMeta } from '../model/TransferModels';
 import { createGsFacade, GsFacade, GsReceiveHooks, GS_NEARSHARE_PORT } from '../protocol/gs/GsFacade';
+import { DynamicPhotoService, IncomingFileLike } from '../common/DynamicPhotoService';
+import { GalleryAutoSaveService } from '../quickshare/service/GalleryAutoSaveService';
+import { CardSurface } from '../components/CardSurface';
+import { AccentColorSentinel } from '../components/MaterialCard';
 
 @Entry
 @Component
 struct NearSharingReceivePage {
+  /** 主题色变化时触发重建，让 HwColor.primary 与选中态取到新色值 */
+  @StorageProp('accentColor') @Watch('onAccentColorChanged') accentColor: string = '';
+  /** 页面底色（由 applyAppTheme 发布）。直接读 HwColor.background 登记不上依赖 */
+  @StorageProp('pageBackground') pageBackground: string = '';
   @StorageProp('statusBarHeight') statusBarHeight: number = 0;
   @StorageProp('isDarkMode') isDarkMode: boolean = false;
   @StorageLink('immersiveLightEnabled') immersiveLightEnabled: boolean = true;
+  @StorageLink('beautifulCards') beautifulCards: boolean = false;
+  @StorageLink('classicCards') classicCards: boolean = false;
+  @StorageLink('cardShadowBorder') cardShadowBorder: boolean = true;
+  @StorageLink('experimentalCards') experimentalCards: boolean = false;
   @StorageLink('fontMode') fontMode: string = 'system';
   @StorageLink('fontFamilyEn') fontFamilyEn: string = 'system';
   @StorageLink('fontFamilyZh') fontFamilyZh: string = 'system';
@@ -28,6 +40,7 @@ struct NearSharingReceivePage {
   @State progress: number = 0;
   private facade?: GsFacade;
   private loadedFromParams = false;
+  private receiveScope: string = '';
 
   private appFontFamily(content: string): string {
     if (this.fontMode !== 'custom') {
@@ -61,17 +74,23 @@ struct NearSharingReceivePage {
     this.facade = createGsFacade('windowsnearby', context);
     const hooks: GsReceiveHooks = {
       onIncomingSession: (key: string, peerName: string, files: SessionFileMeta[], pin: string): Promise<boolean> => {
-        return this.onIncomingSession(peerName, files, pin);
+        return this.onIncomingSession(key, peerName, files, pin);
       },
-      onFileReceived: (file: IncomingFile): void => {
-        this.statusText = '已接收：' + file.name;
-        this.incomingFiles = this.incomingFiles.concat([file]);
+      onFileReceived: async (file: IncomingFile): Promise<void> => {
+        await this.handleIncomingFile(file);
+      },
+      onSessionFailed: (key: string, reason: string): void => {
+        if (this.receiveScope === 'nearshare:' + key) {
+          this.statusText = '接收失败：' + reason;
+          DynamicPhotoService.settleBatch(context, [], this.receiveScope).catch((): void => undefined);
+        }
       },
       onProgress: (percent: number): void => {
         this.progress = percent;
         this.statusText = '接收中 ' + Math.floor(percent) + '%';
         if (percent >= 100) {
           this.statusText = '接收完成';
+          DynamicPhotoService.settleBatch(context, [], this.receiveScope).catch((): void => undefined);
         }
       }
     };
@@ -82,6 +101,55 @@ struct NearSharingReceivePage {
     });
   }
 
+  private async handleIncomingFile(file: IncomingFile): Promise<void> {
+    const context = getContext(this) as common.UIAbilityContext;
+    const savedPath: string = file.savedPath ?? '';
+    let resolved: IncomingFile = file;
+    const dynamicSelf: IncomingFileLike = {
+      name: file.name,
+      size: file.size,
+      savedPath: savedPath
+    };
+    const dynamicBatch: IncomingFileLike[] =
+      this.incomingFiles.concat([file]).map(
+        (item: IncomingFile): IncomingFileLike => ({
+          name: item.name,
+          size: item.size,
+          savedPath: item.savedPath ?? ''
+        })
+      );
+    try {
+      await DynamicPhotoService.settleReceivedFile(context, dynamicSelf, dynamicBatch, this.receiveScope);
+    } catch (error) {
+      Lg.w('[DYNAMIC] settle (nearshare) failed: '
+        + (error instanceof Error ? error.message : JSON.stringify(error)));
+    }
+    if (!DynamicPhotoService.isClaimedByDynamicPhoto(savedPath)
+      && GalleryAutoSaveService.isSandboxPath(context, savedPath)) {
+      try {
+        const processed = await GalleryAutoSaveService.processCompleted(
+          context, savedPath, file.name, file.size, false, file.mime ?? '');
+        if (processed.finalPath.length > 0) {
+          resolved = {
+            name: file.name,
+            size: file.size,
+            savedPath: processed.finalPath
+          };
+        }
+        Lg.i('[GALLERY] nearshare handled=' + processed.handled
+          + ' gallery=' + processed.savedToGallery
+          + ' name=' + file.name
+          + ' final=' + processed.finalPath
+          + ' error=' + processed.error);
+      } catch (error) {
+        Lg.w('[GALLERY] nearshare save failed: '
+          + (error instanceof Error ? error.message : JSON.stringify(error)));
+      }
+    }
+    this.statusText = '已接收：' + resolved.name;
+    this.incomingFiles = this.incomingFiles.concat([resolved]);
+  }
+
   aboutToDisappear(): void {
     // 注意：本页只消费全局 NearbyScanHub 的状态，绝不自建 WindowsNearbyBleController。
     // 鸿蒙 BLE 广播/扫描是全局单例，页面自建控制器会在 start() 时顶掉 Hub 的广播、
@@ -90,8 +158,20 @@ struct NearSharingReceivePage {
     this.facade = undefined;
   }
 
+  /** 主题色变了：HwColor 是模块级对象，改属性不会触发刷新，靠这里重建页面 */
+  onAccentColorChanged(): void {
+    reloadAppTheme();
+  }
+
+  /** 当前主题色。读 accentColor 建立依赖；直接写 HwColor.primary 切色后不会重新求值 */
+  private accentOrPrimary(): string {
+    return this.accentColor.length > 0 ? this.accentColor : HwColor.primary;
+  }
+
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
+      // 主题色依赖：切色时让整页重新求值（零尺寸，不参与布局）
+      AccentColorSentinel()
       AppBackground()
       Column() {
         Scroll() {
@@ -121,47 +201,50 @@ struct NearSharingReceivePage {
       .backgroundColor(Color.Transparent)
 
       Row() {
-        IconCircleButton({ symbol: $r('sys.symbol.chevron_left'), buttonSize: 40, iconSize: 20, onAction: (): void => router.back() })
+        IconCircleButton({ symbol: $r('sys.symbol.chevron_left'), glass: true, buttonSize: 40, iconSize: 20, onAction: (): void => router.back() })
         Text('Windows Nearby 接收').fontSize(20).fontWeight(FontWeight.Bold).fontFamily(this.appFontFamily('Windows Nearby 接收')).fontColor(hwTextPrimary(this.isDarkMode)).margin({ left: HwSpace.md })
         Blank()
       }
       .width('100%')
       .height(56 + this.statusBarHeight)
       .padding({ left: 16, right: 16, top: this.statusBarHeight })
-      .backgroundEffect({ radius: 12, color: '#66FFFFFF' })
+      .backgroundEffect({ radius: 12, color: topBarGlassColor(this.isDarkMode) })
     }
     .width('100%')
     .height('100%')
-    .backgroundColor(this.isDarkMode ? HwColor.backgroundDark : HwColor.background)
+    .backgroundColor(resolvePageBackground(this.isDarkMode, this.pageBackground))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
   @Builder
   receivedFilesCard() {
-    Column({ space: 6 }) {
-      Text('已接收文件（' + this.incomingFiles.length + '）').fontSize(14).fontWeight(FontWeight.Medium).fontFamily(this.appFontFamily('已接收文件')).fontColor(hwTextPrimary(this.isDarkMode))
-      ForEach(this.incomingFiles, (file: IncomingFile): void => {
-        Column({ space: 4 }) {
-          Row({ space: 8 }) {
-            Text(file.name).layoutWeight(1).fontSize(13).fontFamily(this.appFontFamily(file.name)).fontWeight(this.appFontWeight()).fontColor(hwTextPrimary(this.isDarkMode))
-              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-            Text(this.fileSizeText(file.size)).fontSize(12).fontFamily(this.appFontFamily(this.fileSizeText(file.size))).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
-            Button('打开', { type: ButtonType.Capsule }).height(26).fontSize(12).fontFamily(this.appFontFamily('打开'))
-              .backgroundColor(hwPrimaryButton(this.isDarkMode)).fontColor(Color.White)
-              .onClick(() => this.openFile(file))
+    CardSurface({ radius: HwRadius.card }) {
+      Column({ space: 6 }) {
+        Text('已接收文件（' + this.incomingFiles.length + '）').fontSize(14).fontWeight(FontWeight.Medium).fontFamily(this.appFontFamily('已接收文件')).fontColor(hwTextPrimary(this.isDarkMode))
+        ForEach(this.incomingFiles, (file: IncomingFile): void => {
+          Column({ space: 4 }) {
+            Row({ space: 8 }) {
+              Text(file.name).layoutWeight(1).fontSize(13).fontFamily(this.appFontFamily(file.name)).fontWeight(this.appFontWeight()).fontColor(hwTextPrimary(this.isDarkMode))
+                .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text(this.fileSizeText(file.size)).fontSize(12).fontFamily(this.appFontFamily(this.fileSizeText(file.size))).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
+              Button('打开', { type: ButtonType.Capsule }).height(26).fontSize(12).fontFamily(this.appFontFamily('打开'))
+                .backgroundColor(resolvePrimaryButtonColor(this.isDarkMode, this.accentOrPrimary())).fontColor(onAccentColor(this.accentOrPrimary()))
+                .onClick(() => this.openFile(file))
+            }.width('100%')
+            Text(file.savedPath).fontSize(11).fontFamily(this.appFontFamily(file.savedPath)).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
+              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
           }.width('100%')
-          Text(file.savedPath).fontSize(11).fontFamily(this.appFontFamily(file.savedPath)).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
-            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
-        }.width('100%')
-      }, (file: IncomingFile): string => file.savedPath + ':' + file.name)
+        }, (file: IncomingFile): string => file.savedPath + ':' + file.name + ':' + this.accentColor)
+      }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
   }
 
   private loadParams(): void {
@@ -196,8 +279,9 @@ struct NearSharingReceivePage {
       Lg.w('NearSharingReceive loadParams failed: ' + JSON.stringify(error));
     }
   }
-  private onIncomingSession(peerName: string, files: SessionFileMeta[], pin: string): Promise<boolean> {
+  private onIncomingSession(key: string, peerName: string, files: SessionFileMeta[], pin: string): Promise<boolean> {
     return promptAction.showDialog({
+      systemMaterial: dialogSystemMaterial(),
       title: 'Windows Nearby 接收请求',
       message: `「${peerName}」想发送 ${files.length} 个文件。双方 PIN：${pin}\n是否接收？`,
       buttons: [
@@ -206,6 +290,8 @@ struct NearSharingReceivePage {
       ]
     }).then((result: promptAction.ShowDialogSuccessResponse): boolean => {
       if (result.index === 1) {
+        this.receiveScope = 'nearshare:' + key;
+        this.incomingFiles = [];
         this.peerName = peerName;
         this.progress = 0;
         this.statusText = '开始接收';
@@ -226,11 +312,11 @@ struct NearSharingReceivePage {
         parameters: { 'ohos.aafwk.param.bundleName': 'com.cashmere.link' }
       }).catch((error: BusinessError): void => {
         Lg.e('Windows Nearby receive open file failed: ' + JSON.stringify(error));
-        promptAction.showToast({ message: '无法打开：' + (error.message ?? ''), duration: 2000 });
+        promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开：' + (error.message ?? ''), duration: 2000 });
       });
     } catch (error) {
       Lg.e('Windows Nearby receive open file error: ' + JSON.stringify(error));
-      promptAction.showToast({ message: '无法打开文件', duration: 2000 });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开文件', duration: 2000 });
     }
   }
 

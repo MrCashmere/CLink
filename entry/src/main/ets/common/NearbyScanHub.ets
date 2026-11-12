@@ -7,9 +7,13 @@ import { DeviceEndpoint, IncomingFile, SessionFileMeta } from '../model/Transfer
 import { AppServices } from './AppServices';
 import { PermissionHelper } from './PermissionHelper';
 import { SettingsStore } from './SettingsStore';
+import { DynamicPhotoService } from './DynamicPhotoService';
+import { IncomingFileLike } from './DynamicPhotoService';
+import { TransferManager } from '../service/TransferManager';
 import { PinDialogGuard } from './PinDialogGuard';
 import { HwColor } from '../utils/DesignTokens';
 import { getLocalIpv4 } from './NetAddress';
+import { GalleryAutoSaveService } from '../quickshare/service/GalleryAutoSaveService';
 import { QuickShareBrowser, QuickSharePageEndpoint } from '../quickshare/controller/QuickShareBrowser';
 import { createGsFacade, GsFacade } from '../protocol/gs/GsFacade';
 import {
@@ -33,6 +37,8 @@ import {
   WindowsNearbySender,
   WindowsNearbySenderListener
 } from '../windowsnearby/WindowsNearbySender';
+import { toastSystemMaterial, dialogSystemMaterial } from '../utils/SystemMaterial';
+import { MtaService } from '../mta/MtaService';
 
 // 蓝牙发现 / BLE 扫描所需用户授权权限，全局扫描启动时逐项申请。
 const BLUETOOTH_AND_LOCATION_PERMISSIONS: Permissions[] = [
@@ -75,18 +81,20 @@ class HubWindowsTransferListener extends WindowsNearbyTransferListener {
   private readonly onConnectedCb: (peerName: string) => void;
   private readonly onDiscoveredCb: (peerName: string, ip: string) => void;
   private readonly onIncomingCb: (peerName: string, files: WindowsNearbyIncomingFile[]) => Promise<boolean>;
-  private readonly onFileCb: (file: WindowsNearbyIncomingFile, savedPath: string) => void;
+  private readonly onFileCb: (file: WindowsNearbyIncomingFile, savedPath: string) => Promise<void>;
   private readonly onProgressCb: (percent: number) => void;
   private readonly onCompletedCb: () => void;
+  private readonly onFailedCb: (reason: string) => void;
 
   constructor(
     onStatusCb: (text: string) => void,
     onConnectedCb: (peerName: string) => void,
     onDiscoveredCb: (peerName: string, ip: string) => void,
     onIncomingCb: (peerName: string, files: WindowsNearbyIncomingFile[]) => Promise<boolean>,
-    onFileCb: (file: WindowsNearbyIncomingFile, savedPath: string) => void,
+    onFileCb: (file: WindowsNearbyIncomingFile, savedPath: string) => Promise<void>,
     onProgressCb: (percent: number) => void,
-    onCompletedCb: () => void
+    onCompletedCb: () => void,
+    onFailedCb: (reason: string) => void
   ) {
     super();
     this.onStatusCb = onStatusCb;
@@ -96,6 +104,7 @@ class HubWindowsTransferListener extends WindowsNearbyTransferListener {
     this.onFileCb = onFileCb;
     this.onProgressCb = onProgressCb;
     this.onCompletedCb = onCompletedCb;
+    this.onFailedCb = onFailedCb;
   }
   onStatus(text: string): void {
     this.onStatusCb(text);
@@ -109,8 +118,11 @@ class HubWindowsTransferListener extends WindowsNearbyTransferListener {
   onIncomingTransfer(peerName: string, files: WindowsNearbyIncomingFile[]): Promise<boolean> {
     return this.onIncomingCb(peerName, files);
   }
-  onFileReceived(file: WindowsNearbyIncomingFile, savedPath: string): void {
-    this.onFileCb(file, savedPath);
+  onFailed(reason: string): void {
+    this.onFailedCb(reason);
+  }
+  onFileReceived(file: WindowsNearbyIncomingFile, savedPath: string): Promise<void> {
+    return this.onFileCb(file, savedPath);
   }
   onProgress(percent: number): void {
     this.onProgressCb(percent);
@@ -121,7 +133,7 @@ class HubWindowsTransferListener extends WindowsNearbyTransferListener {
 }
 
 /**
- * 应用全局的「三协议仅接收扫描 + Windows 接收」枢纽。
+ * 应用全局的多协议扫描与接收枢纽，MTA 作为独立服务叠加。
  *
  * 聚合页此前只在「聚合」页签挂载时才启动扫描；本枢纽把该扫描（以及聚合页发送所需的
  * 浏览器 / 发送器实例）提升到应用进程生命周期，使 Quick Share、Windows Nearby、
@@ -129,9 +141,8 @@ class HubWindowsTransferListener extends WindowsNearbyTransferListener {
  * 发送也由本枢纽独占，NearSharing 页改为消费枢纽状态而非自建扫描器 / 接收器（避免与全局
  * BLE 单例、TCP 5040 接收器重复绑定）。
  *
- * BLE 说明：HarmonyOS 的 BLE 扫描是全局单例（过滤器和 BLEDeviceFind 回调互相覆盖）。
- * 因此本枢纽只让 Windows Nearby 的 BLE 控制器独占 BLE 扫描，Quick Share 浏览器传
- * false 禁用其 BLE、改为纯 mDNS 发现（LAN TCP 发送），与聚合页原有策略一致。
+ * BLE 说明：HarmonyOS 的 BLE 扫描是共享资源，Windows/MTA 等扫描器由扫描租约合并调度。
+ * Quick Share 浏览器继续保留聚合页原有的纯 mDNS 策略（false），独立页的 BLE 扫描也消费租约。
  */
 export class NearbyScanHub {
   private static instance?: NearbyScanHub;
@@ -145,9 +156,13 @@ export class NearbyScanHub {
   /** 本机局域网 IPv4，用于 Quick Share 发送时的 sourceAddress。 */
   localIp: string = '';
   readonly appServices: AppServices;
+  mta?: MtaService;
 
   private readonly context: common.UIAbilityContext;
   private started = false;
+  private generation: number = 0;
+  private windowsReceiveStart?: Promise<void>;
+  private windowsSenderStart?: Promise<void>;
   /** 是否已向系统申请过蓝牙/定位权限（仅申请一次，避免重复弹窗提示）。 */
   private permissionRequested = false;
   private readonly listeners: Set<ChangeListener> = new Set();
@@ -203,6 +218,18 @@ export class NearbyScanHub {
     return this.localSendDevices.slice();
   }
 
+  getMtaDevices(): DeviceEndpoint[] { return this.mta?.enabled() === true ? this.mta.devices() : []; }
+
+  private startMta(): void {
+    try {
+      if (this.mta === undefined) {
+        this.mta = MtaService.get(this.context);
+        this.mta.addListener((): void => this.notify());
+      }
+      this.mta.start();
+    } catch (error) { Lg.w('[MTA] 初始化失败：' + String(error)); }
+  }
+
   setOnChange(listener: ChangeListener): void {
     this.listeners.add(listener);
   }
@@ -251,15 +278,20 @@ export class NearbyScanHub {
       return;
     }
     this.started = true;
+    const generation = ++this.generation;
     // 启动期主线程减负：网络扫描/接收的初始化（同步枚举 IP、mDNS 构造与启动、注册监听）
     // 推迟到首帧之后执行，使应用一打开即可响应点击，而不是在首帧渲染与首次交互的关键
     // 窗口内被扫描初始化占用主线程。约一个事件循环后开始，设备只比原来晚一帧出现，无感知。
     setTimeout((): void => {
-      this.doStart();
+      if (this.isCurrent(generation)) { this.doStart(generation); }
     }, 0);
   }
 
-  private doStart(): void {
+  private isCurrent(generation: number): boolean {
+    return this.started && generation === this.generation;
+  }
+
+  private doStart(generation: number): void {
     // 防御：极少数情况下 stop() 可能发生在延迟启动触发前，若已停止则不再初始化。
     if (!this.started) {
       return;
@@ -270,25 +302,23 @@ export class NearbyScanHub {
     // LocalSend 扫描。各部分用 try/catch 隔离，避免一处失败拖垮其余。
     try {
       this.facade = createGsFacade('quickshare', this.context);
-      this.browser = new QuickShareBrowser(this.context, false);
-      this.browser.setOnChange((): void => this.syncQuickShare());
-      this.browser.start();
+      // 绝不能建第二个浏览器：start() 的延迟启动与 restart() 交叠时 doStart 会被调度两次，
+      // 而旧实例既不会再被 stop()，它注册在系统 mdns 守护进程里的广播也不会被移除——
+      // 本机设备列表于是堆出一大堆自己的「羊绒互传」（实测 20 次启动只有 4 次停止）。
+      if (this.browser === undefined) {
+        this.browser = new QuickShareBrowser(this.context, false);
+        this.browser.setOnChange((): void => this.syncQuickShare());
+        this.browser.start();
+      } else {
+        Lg.i('[NEARBY-SCAN] Quick Share browser already running, reusing it');
+      }
     } catch (error) {
       Lg.w('[NEARBY-SCAN] Quick Share browser start failed: ' + JSON.stringify(error));
     }
-    const senderListener = new HubWindowsSenderListener((text: string): void => {
-      // 状态文本不再展示，忽略
-    }, (): void => {
-      // 发送完成，无需额外处理
-    });
-    WindowsNearbySender.create(this.context, senderListener).then((sender: WindowsNearbySender): void => {
-      this.windowsSender = sender;
-    }).catch((error: Error): void => {
-      Lg.w('[NEARBY-SCAN] WindowsNearbySender.create failed: ' + error.message);
-    });
+    this.startWindowsSender();
     // LocalSend 扫描：等待首页接收/服务器就绪后开始。
     this.appServices.startReceive().then((): void => {
-      this.appServices.startLocalSendScanning();
+      if (this.isCurrent(generation)) { this.appServices.startLocalSendScanning(); }
     }).catch((error: BusinessError): void => {
       Lg.w('[NEARBY-SCAN] LocalSend 扫描启动失败: ' + error.message);
     });
@@ -296,6 +326,21 @@ export class NearbyScanHub {
     // 就绪，权限弹窗可能无法正常显示。改由 Index.onPageShow → ensureActive() 在 UI 就绪后
     // 申请权限并启动 Windows BLE 扫描/广播 + Windows 接收器。
     Lg.i('[NEARBY-SCAN] global receive-only scan started (quickshare mDNS + windows BLE/receive + localsend)');
+  }
+
+  private startWindowsSender(): void {
+    if (!this.started || this.windowsSender !== undefined || this.windowsSenderStart !== undefined) { return; }
+    const generation = this.generation;
+    const listener = new HubWindowsSenderListener((): void => {}, (): void => {});
+    this.windowsSenderStart = WindowsNearbySender.create(this.context, listener).then(async (sender: WindowsNearbySender): Promise<void> => {
+      if (!this.isCurrent(generation)) { await sender.close(); return; }
+      this.windowsSender = sender;
+    }).catch((error: Error): void => {
+      Lg.w('[NEARBY-SCAN] Windows sender start: ' + error.message);
+    }).finally((): void => {
+      this.windowsSenderStart = undefined;
+      if (this.started && generation !== this.generation) { this.startWindowsSender(); }
+    });
   }
 
   /** 启动 Windows Nearby 的 BLE 扫描/广播（需蓝牙 + 定位权限已就绪）。 */
@@ -315,28 +360,58 @@ export class NearbyScanHub {
 
   /** 启动 Windows Nearby 接收器（TCP 5040 + UDP 发现/广播 + 蓝牙 RFCOMM 监听）。 */
   private startWindowsReceive(): void {
-    if (this.windowsTransfer !== undefined) {
+    if (!this.started || this.windowsTransfer !== undefined || this.windowsReceiveStart !== undefined) {
       return;
     }
+    const generation = this.generation;
+    let receiver: WindowsNearbyTransfer | undefined = undefined;
+    const current = (): boolean => this.isCurrent(generation) && receiver !== undefined && this.windowsTransfer === receiver;
     try {
       const listener = new HubWindowsTransferListener(
         (text: string): void => {
           Lg.i('[NEARBY-SCAN] Windows received status: ' + text);
         },
-        (peerName: string): void => this.onWindowsConnected(peerName),
-        (peerName: string, ip: string): void => this.onWindowsPeerIp(peerName, ip),
-        (peerName: string, files: WindowsNearbyIncomingFile[]): Promise<boolean> => this.confirmWindowsIncoming(peerName, files),
-        (file: WindowsNearbyIncomingFile, savedPath: string): void => this.onWindowsFileReceived(file, savedPath),
-        (percent: number): void => this.onWindowsProgress(percent),
-        (): void => this.onWindowsCompleted()
+        (peerName: string): void => { if (current()) { this.onWindowsConnected(peerName); } },
+        (peerName: string, ip: string): void => { if (current()) { this.onWindowsPeerIp(peerName, ip); } },
+        (peerName: string, files: WindowsNearbyIncomingFile[]): Promise<boolean> => {
+          if (!current() || receiver === undefined) { return Promise.resolve(false); }
+          const sessionValid = receiver.captureSessionValidity();
+          return this.confirmWindowsIncoming(peerName, files, (): boolean => current() && sessionValid());
+        },
+        (file: WindowsNearbyIncomingFile, savedPath: string): Promise<void> => {
+          if (!current() || receiver === undefined) { return Promise.resolve(); }
+          const sessionValid = receiver.captureSessionValidity();
+          return this.onWindowsFileReceived(file, savedPath, (): boolean => current() && sessionValid());
+        },
+        (percent: number): void => { if (current()) { this.onWindowsProgress(percent); } },
+        (): void => { if (current()) { this.onWindowsCompleted(); } },
+        (reason: string): void => {
+          if (!current()) { return; }
+          if (this.windowsReceiveTaskId.length > 0) {
+            this.appServices.transfer.finishTask(this.windowsReceiveTaskId, false, reason);
+            this.windowsReceiveTaskId = '';
+            this.publishWindowsLive();
+            this.notifyWindowsReceive();
+          }
+        }
       );
-      WindowsNearbyTransfer.create(this.context, listener).then((transfer: WindowsNearbyTransfer): void => {
+      this.windowsReceiveStart = WindowsNearbyTransfer.create(this.context, listener).then(async (transfer: WindowsNearbyTransfer): Promise<void> => {
+        receiver = transfer;
+        if (!this.isCurrent(generation)) { transfer.stop(); return; }
         this.windowsTransfer = transfer;
-        transfer.start().catch((error: Error): void => {
-          Lg.w('[NEARBY-SCAN] WindowsNearbyTransfer.start failed: ' + error.message);
-        });
+        try {
+          await transfer.start();
+          if (!current()) { transfer.stop(); }
+        } catch (error) {
+          transfer.stop();
+          if (this.windowsTransfer === transfer) { this.windowsTransfer = undefined; }
+          throw error as Error;
+        }
       }).catch((error: Error): void => {
-        Lg.w('[NEARBY-SCAN] WindowsNearbyTransfer.create failed: ' + error.message);
+        Lg.w('[NEARBY-SCAN] Windows receiver start: ' + error.message);
+      }).finally((): void => {
+        this.windowsReceiveStart = undefined;
+        if (this.started && generation !== this.generation) { this.startWindowsReceive(); }
       });
     } catch (error) {
       Lg.w('[NEARBY-SCAN] Windows transfer start failed: ' + JSON.stringify(error));
@@ -366,12 +441,16 @@ export class NearbyScanHub {
     } else {
       this.requestPermissionAndStartWindows();
     }
+    this.startWindowsSender();
+    if (this.windowsController !== undefined) { this.startWindowsReceive(); }
     this.appServices.startLocalSendScanning();
     Lg.i('[NEARBY-SCAN] LocalSend scan re-asserted');
+    this.startMta();
   }
 
   /** UI 就绪后申请蓝牙/定位权限（仅一次），再启动 Windows BLE 扫描/广播 + 接收器。 */
   private requestPermissionAndStartWindows(): void {
+    const generation = this.generation;
     if (!this.started) {
       return;
     }
@@ -381,52 +460,45 @@ export class NearbyScanHub {
     if (!this.permissionRequested) {
       this.permissionRequested = true;
       PermissionHelper.ensure(this.context, BLUETOOTH_AND_LOCATION_PERMISSIONS).then((): void => {
-        this.startWindowsComponents();
+        this.startWindowsComponents(generation).catch((error: Error): void => Lg.w('[NEARBY-SCAN] start components: ' + error.message));
       }).catch((): void => {
-        this.startWindowsComponents();
+        this.startWindowsComponents(generation).catch((error: Error): void => Lg.w('[NEARBY-SCAN] start components: ' + error.message));
       });
     } else {
       // 已申请过（用户可能拒绝或仍未授权）：不重复弹窗，仅尝试启动（失败则静默）。
-      this.startWindowsComponents();
+      this.startWindowsComponents(generation).catch((error: Error): void => Lg.w('[NEARBY-SCAN] start components: ' + error.message));
     }
   }
 
-  private async startWindowsComponents(): Promise<void> {
+  private async startWindowsComponents(generation: number): Promise<void> {
     // 冷启动竞态修复：SettingsStore.load() 是异步的，只有在 UI 加载完成后才把持久化的设置
     // 填入缓存。若在它完成之前就启动 BLE 广播，buildStableMac() 会读到空的 btMac 并伪造一个
-    // 地址（如 48:55:41:57:45:49），Windows 只会“扫到”手机却无法按该地址走 RFCOMM 连入。
+    // 占位地址，Windows 只会“扫到”手机却无法按该地址走 RFCOMM 连入。
     // 这里先等设置加载完成，确保用真实蓝牙 MAC 广播。
     await SettingsStore.load(this.context);
+    if (!this.isCurrent(generation)) { return; }
     this.startWindowsBle();
     this.startWindowsReceive();
+    this.startMta();
   }
 
   stop(): void {
     this.teardown(true);
   }
 
-  /**
-   * 重启三种协议的发现 / 广播 / 接收，效果对齐「杀掉应用重新打开」：
-   *  1. 拆掉 Quick Share 浏览器（mDNS 发现 + 广播）、Windows BLE 扫描/广播与接收器、
-   *     Windows 发送器、LocalSend 扫描；
-   *  2. 重启接收侧（LocalSend HTTP(S) 服务端 + Quick Share 接收 + BLE medium）；
-   *  3. 按冷启动顺序 start() → ensureActive() 重新拉起全部三协议。
-   *
-   * 与 stop() + start() 的区别：不清空页面注册的监听（设备变化 / Windows 接收状态），
-   * 刷新期间无需重新挂载页面；也不会重复弹权限申请窗。
-   */
+  /** 只重启发现与广播；收发连接、接收监听和待确认会话保持原生命周期。 */
   async restart(): Promise<void> {
-    Lg.i('[NEARBY-SCAN] restart requested: 重启三协议广播（发现 + 广播 + 接收）');
-    this.teardown(false);
-    // 重启接收侧：端口与 BLE 资源释放后再重新绑定，避免刚 stop 就 bind 失败。
-    await this.appServices.restartReceive();
-    this.start();
-    // start() 内部的 doStart 延后一拍执行，这里同样延后再断言 Windows BLE / 接收器，
-    // 保持与冷启动（onWindowStageCreate → start，onPageShow → ensureActive）一致的顺序。
-    setTimeout((): void => {
-      this.ensureActive();
-    }, 0);
-    Lg.i('[NEARBY-SCAN] restart done');
+    if (!this.started) { this.start(); this.ensureActive(); return; }
+    this.browser?.stop();
+    this.browser?.start();
+    this.windowsController?.stop();
+    this.windowsController?.start();
+    this.appServices.stopLocalSendScanning();
+    this.appServices.startLocalSendScanning();
+    this.mta?.refreshDiscovery();
+    this.startWindowsSender();
+    this.requestPermissionAndStartWindows();
+    Lg.i('[NEARBY-SCAN] discovery/advertising restarted; transfers retained');
   }
 
   /**
@@ -438,6 +510,12 @@ export class NearbyScanHub {
       return;
     }
     this.started = false;
+    this.generation += 1;
+    if (this.windowsReceiveTaskId.length > 0) {
+      this.appServices.transfer.finishTask(this.windowsReceiveTaskId, false, 'Windows 接收服务已停止');
+      this.windowsReceiveTaskId = '';
+    }
+    this.mta?.stop().catch((error: Error): void => Lg.w('[MTA] stop: ' + error.message));
     this.browser?.stop();
     this.browser = undefined;
     this.facade = undefined;
@@ -495,13 +573,14 @@ export class NearbyScanHub {
   }
 
   /** Windows 发送方发起会话：弹确认框，用户接受才继续接收并记录会话。 */
-  private confirmWindowsIncoming(peerName: string, files: WindowsNearbyIncomingFile[]): Promise<boolean> {
-    if (!PinDialogGuard.tryBegin()) {
+  private confirmWindowsIncoming(peerName: string, files: WindowsNearbyIncomingFile[], isCurrent: () => boolean): Promise<boolean> {
+    if (!isCurrent() || !PinDialogGuard.tryBegin()) {
       return Promise.resolve(false);
     }
     const fileNames = files.map((file: WindowsNearbyIncomingFile): string => file.name).join('、');
     const detail = fileNames.length > 0 ? '：' + fileNames : '';
     return promptAction.showDialog({
+      systemMaterial: dialogSystemMaterial(),
       title: 'Windows Nearby 接收请求',
       message: `「${peerName}」想发送 ${files.length} 个文件${detail}。\n是否接收？`,
       buttons: [
@@ -510,6 +589,7 @@ export class NearbyScanHub {
       ]
     }).then((result: promptAction.ShowDialogSuccessResponse): boolean => {
       PinDialogGuard.end();
+      if (!isCurrent()) { return false; }
       const accepted = result.index === 1;
       if (accepted) {
         this.windowsReceivePeer = peerName;
@@ -539,27 +619,78 @@ export class NearbyScanHub {
     });
   }
 
-  private onWindowsFileReceived(file: WindowsNearbyIncomingFile, savedPath: string): void {
+  private async onWindowsFileReceived(file: WindowsNearbyIncomingFile,
+    savedPath: string, isCurrent: () => boolean): Promise<void> {
+    if (!isCurrent()) { return; }
+    const taskId = this.windowsReceiveTaskId;
+    const peer = this.windowsReceivePeer;
     const incoming: IncomingFile = {
       name: file.name,
       size: file.size,
       savedPath: savedPath
     };
-    this.windowsReceiveFiles = this.windowsReceiveFiles.concat([incoming]);
+    let resolved: IncomingFile = incoming;
+
+    // 先跑动态照片归属判断；动态照片占用时普通图库管线必须让路。
+    const dynamicSelf: IncomingFileLike = {
+      name: incoming.name,
+      size: incoming.size,
+      savedPath: incoming.savedPath ?? ''
+    };
+    const dynamicBatch: IncomingFileLike[] =
+      this.windowsReceiveFiles.concat([incoming]).map(
+        (item: IncomingFile): IncomingFileLike => ({
+          name: item.name,
+          size: item.size,
+          savedPath: item.savedPath ?? ''
+        })
+      );
+    try {
+      await DynamicPhotoService.settleReceivedFile(this.context, dynamicSelf, dynamicBatch, 'windowsnearby:' + taskId);
+    } catch (error) {
+      Lg.w('[DYNAMIC] settle (windowsnearby) failed: '
+        + (error instanceof Error ? error.message : JSON.stringify(error)));
+    }
+
+    if (!isCurrent()) { return; }
+    if (GalleryAutoSaveService.isSandboxPath(this.context, savedPath)) {
+      try {
+        const processed = await GalleryAutoSaveService.processCompleted(
+          this.context, savedPath, file.name, file.size, true);
+        if (processed.finalPath.length > 0) {
+          resolved = {
+            name: file.name,
+            size: file.size,
+            savedPath: processed.finalPath
+          };
+        }
+        Lg.i('[GALLERY] windowsnearby handled=' + processed.handled
+          + ' gallery=' + processed.savedToGallery
+          + ' name=' + file.name
+          + ' final=' + processed.finalPath
+          + ' error=' + processed.error);
+      } catch (error) {
+        Lg.w('[GALLERY] windowsnearby save failed: '
+          + (error instanceof Error ? error.message : JSON.stringify(error)));
+      }
+    }
+
+    if (!isCurrent() || this.windowsReceiveTaskId !== taskId) { return; }
+    this.windowsReceiveFiles = this.windowsReceiveFiles.concat([resolved]);
     const entry: WindowsNearbyHistoryEntry = {
-      id: savedPath + ':' + file.name + ':' + Date.now(),
-      name: file.name,
-      size: file.size,
+      id: resolved.savedPath + ':' + resolved.name + ':' + Date.now(),
+      name: resolved.name,
+      size: resolved.size,
       direction: 'receive',
-      peer: this.windowsReceivePeer.length > 0 ? this.windowsReceivePeer : 'Windows',
+      peer: peer.length > 0 ? peer : 'Windows',
       completedAt: Date.now(),
-      savedPath: savedPath
+      savedPath: resolved.savedPath
     };
     WindowsNearbyHistory.add(this.context, entry).catch((): void => undefined);
     this.publishWindowsLive();
     this.notifyWindowsReceive();
-    if (this.windowsReceiveTaskId.length > 0) {
-      this.appServices.transfer.addReceivedFile(this.windowsReceiveTaskId, incoming);
+    if (taskId.length > 0) {
+      this.appServices.transfer.addReceivedFile(taskId, resolved);
     }
   }
 
@@ -573,6 +704,7 @@ export class NearbyScanHub {
   }
 
   private onWindowsCompleted(): void {
+    const taskId = this.windowsReceiveTaskId;
     this.windowsReceiveProgress = 100;
     this.windowsReceiveCompleted = true;
     this.publishWindowsLive();
@@ -581,6 +713,8 @@ export class NearbyScanHub {
       this.appServices.transfer.finishTask(this.windowsReceiveTaskId, true);
       this.windowsReceiveTaskId = '';
     }
+    // 动态图片传输(Beta)：会话结束，给等待配对的动态图片最后一次机会。
+    TransferManager.settleDynamicBatch(this.context, this.windowsReceiveFiles, 'windowsnearby:' + taskId);
     // 会话结束立即重发 BLE 广播，确保下一次 Windows 会话开始时手机可被发现
     // （避免「完成一次传输后第二次搜不到」——广播可能在会话/页面流转中被停掉）。
     this.windowsController?.reassertAdvertisement();
@@ -614,6 +748,7 @@ export class NearbyScanHub {
     buttons.push({ text: '确认', color: HwColor.primary });
 
     promptAction.showDialog({
+      systemMaterial: dialogSystemMaterial(),
       title: '接收完成',
       message: message,
       buttons: buttons
@@ -625,7 +760,7 @@ export class NearbyScanHub {
         if (first !== undefined && first.savedPath.length > 0) {
           this.openWindowsReceivedFile(first.savedPath);
         } else {
-          promptAction.showToast({ message: '文件路径为空', duration: 2000 });
+          promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '文件路径为空', duration: 2000 });
         }
       } else {
         // 确认：仅关闭弹窗，不做任何跳转。此前这里 pushUrl('pages/Index') 会在已有
@@ -647,10 +782,10 @@ export class NearbyScanHub {
         flags: 1,
         parameters: { 'ohos.aafwk.param.bundleName': 'com.cashmere.link' }
       }).catch((error: BusinessError): void => {
-        promptAction.showToast({ message: '无法打开：' + (error.message ?? ''), duration: 2000 });
+        promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开：' + (error.message ?? ''), duration: 2000 });
       });
     } catch (error) {
-      promptAction.showToast({ message: '无法打开文件', duration: 2000 });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开文件', duration: 2000 });
     }
   }
 

@@ -1,15 +1,15 @@
 import fs from '@ohos.file.fs';
-import { picker, fileUri } from '@kit.CoreFileKit';
 import { socket } from '@kit.NetworkKit';
 import { common } from '@kit.AbilityKit';
 import { GsBytes } from '../util/GsBytes';
 import { GsCrypto } from '../util/GsCrypto';
 import { GsTransport, GsTransports } from '../util/GsTransport';
-import { GsDevice, GsIncomingFile, GsOutgoingFile, GsReceiveHooks, GsSendHooks, GsSessionFileMeta, GsStreamConnection, WifiDirectUpgradeCredentials } from '../model/GsTypes';
+import { GsDevice, GsIncomingFile, GsOutgoingFile, GsReceiveHooks, GsSendHooks, GsSessionFileMeta, GsStreamConnection, GsTransportChange, WifiDirectUpgradeCredentials } from '../model/GsTypes';
 import { GS_QUICKSHARE_PORT } from '../model/GsConstants';
 import { UKEY2Handshake } from './UKEY2Handshake';
-import { BandwidthUpgrade, BandwidthUpgradeDecoded, BandwidthUpgradeEvent, BandwidthUpgradeMedium } from './BandwidthUpgrade';
-import { NearDropWire, OfflineType, PayloadFile, SharingType, SharingDecoded, OfflineDecoded, PayloadTransferDecoded, PayloadDecoded } from './NearDropWire';
+import { BandwidthUpgrade, BandwidthUpgradeDecoded, BandwidthUpgradeEvent, BandwidthUpgradeMedium, WifiDirectCredentialOffer } from './BandwidthUpgrade';
+import { NearDropWire, OfflineType, PayloadFile, SharingType, SharingDecoded, OfflineDecoded, PayloadTransferDecoded, PayloadDecoded, PayloadPacket } from './NearDropWire';
+import { NearbyCapabilities, NearbyCapabilitySnapshot } from './NearbyCapabilities';
 import { ProtoReader } from './ProtoReader';
 import { ProtoWire } from './ProtoWire';
 import { GsFrameInbox } from '../util/GsFrameInbox';
@@ -31,35 +31,153 @@ function ukey2Alert(frame: Uint8Array): string | undefined {
 }
 
 const CHUNK_SIZE: number = 512 * 1024;
+// 主动升级的两个有界等待：建组等太久会拖住会话，迁不过来也必须继续在旧通道上把文件收完。
+const P2P_GROUP_WAIT_MS: number = 4000;
+const P2P_UPGRADE_WAIT_MS: number = 10000;
 const TIMEOUT: number = 150000;
 interface WireFramePair { readonly key: number; readonly value: Uint8Array; }
-export interface ReceiverConnection { sendBytes(data: Uint8Array): Promise<void>; onData(listener: (chunk: Uint8Array) => void): void; close(): void; }
+export interface ReceiverConnection {
+  sendBytes(data: Uint8Array): Promise<void>;
+  onData(listener: (chunk: Uint8Array) => void): void;
+  onClose?(listener: () => void): void;
+  close(): void;
+}
 interface ReadFrameResult { readonly frame: Uint8Array; readonly raw: Uint8Array; }
-class TcpReceiverConnection implements ReceiverConnection { private readonly conn: socket.TCPSocketConnection; constructor(conn: socket.TCPSocketConnection) { this.conn = conn; } sendBytes(data: Uint8Array): Promise<void> { return this.conn.send({ data: GsBytes.toArrayBuffer(data) }); } onData(listener: (chunk: Uint8Array) => void): void { this.conn.on('message', (info: socket.SocketMessageInfo): void => listener(new Uint8Array(info.message))); } close(): void { this.conn.close().catch((): void => undefined); } }
-class StreamTransport implements GsTransport { private readonly conn: GsStreamConnection; constructor(conn: GsStreamConnection) { this.conn = conn; } send(data: Uint8Array): Promise<void> { return this.conn.sendBytes(data); } onData(listener: (chunk: Uint8Array) => void): void { this.conn.onData(listener); } close(): Promise<void> { this.conn.close(); return Promise.resolve(); } }
+class TcpReceiverConnection implements ReceiverConnection {
+  private readonly conn: socket.TCPSocketConnection;
+  private dataListener?: (chunk: Uint8Array) => void;
+  private closeListener?: () => void;
+  private closed: boolean = false;
+
+  constructor(conn: socket.TCPSocketConnection) {
+    this.conn = conn;
+    conn.on('message', (info: socket.SocketMessageInfo): void => this.dataListener?.(new Uint8Array(info.message)));
+    conn.on('close', (): void => this.markClosed());
+    conn.on('error', (): void => this.close());
+  }
+
+  sendBytes(data: Uint8Array): Promise<void> { return this.conn.send({ data: GsBytes.toArrayBuffer(data) }); }
+  onData(listener: (chunk: Uint8Array) => void): void { this.dataListener = listener; }
+  onClose(listener: () => void): void {
+    this.closeListener = listener;
+    if (this.closed) { listener(); }
+  }
+  close(): void {
+    if (this.closed) { return; }
+    this.markClosed();
+    this.conn.close().catch((): void => undefined);
+  }
+  private markClosed(): void {
+    if (this.closed) { return; }
+    this.closed = true;
+    this.dataListener = undefined;
+    this.closeListener?.();
+  }
+}
+class StreamTransport implements GsTransport {
+  private readonly conn: GsStreamConnection;
+  constructor(conn: GsStreamConnection) { this.conn = conn; }
+  send(data: Uint8Array): Promise<void> { return this.conn.sendBytes(data); }
+  onData(listener: (chunk: Uint8Array) => void): void { this.conn.onData(listener); }
+  onClose(listener: () => void): void { this.conn.onClose?.(listener); }
+  close(): Promise<void> { this.conn.close(); return Promise.resolve(); }
+}
 class ReceiverSession {
   readonly inbox: WireInbox = new WireInbox();
   readonly handshake: UKEY2Handshake = new UKEY2Handshake('server');
   readonly hooks: GsReceiveHooks;
   activeConn: ReceiverConnection;
   peerEndpointId: string = '';
-  upgradeResolve?: () => void;
+  consentKey: string = '';
+  accepted: boolean = false;
+  upgraded: boolean = false;
+  upgradeResolve?: (migrated: boolean) => void;
+
   constructor(conn: ReceiverConnection, hooks: GsReceiveHooks) {
     this.activeConn = conn;
     this.hooks = hooks;
-    conn.onData((chunk: Uint8Array): void => this.inbox.push(chunk));
+    this.bind(conn);
   }
   send(bytes: Uint8Array): Promise<void> { return this.activeConn.sendBytes(bytes); }
+  private bind(conn: ReceiverConnection): void {
+    conn.onData((chunk: Uint8Array): void => {
+      if (this.activeConn === conn) { this.inbox.push(chunk); }
+    });
+    conn.onClose?.((): void => {
+      if (this.activeConn === conn) { this.inbox.end(new Error('对端连接已断开')); }
+    });
+  }
   rewire(conn: ReceiverConnection): void {
     const old: ReceiverConnection = this.activeConn;
     this.activeConn = conn;
-    conn.onData((chunk: Uint8Array): void => this.inbox.push(chunk));
-    if (old !== conn) {
-      old.close();
-    }
+    this.upgraded = true;
+    this.bind(conn);
+    if (old !== conn) { old.close(); }
   }
 }
-class WireInbox { private readonly inbox: GsFrameInbox<Uint8Array> = new GsFrameInbox<Uint8Array>(); private buffer: Uint8Array = new Uint8Array(0); push(chunk: Uint8Array): void { this.buffer = GsBytes.concat([this.buffer, chunk]); while (this.buffer.length >= 4) { const len: number = ((this.buffer[0] * 0x1000000) + (this.buffer[1] << 16) + (this.buffer[2] << 8) + this.buffer[3]) >>> 0; if (len > 16 * 1024 * 1024) throw new Error('frame too large'); if (this.buffer.length < len + 4) return; const body: Uint8Array = this.buffer.slice(4, len + 4); this.buffer = this.buffer.slice(len + 4); const key: number = WireInbox.key(body); console.info('[UKEY2] recv frame key=' + key + ' len=' + body.length); this.inbox.deliver(key, body); } } next(key: number): Promise<Uint8Array> { return this.inbox.next(key, TIMEOUT); } queuedCount(key: number): number { return this.inbox.queuedCount(key); } nextAny(keys: number[]): Promise<WireFramePair> { return this.waitAny(keys, TIMEOUT); } private async waitAny(keys: number[], timeoutMs: number): Promise<WireFramePair> { const deadline: number = Date.now() + timeoutMs; while (Date.now() < deadline) { for (const key of keys) { if (this.inbox.queuedCount(key) > 0) { return { key, value: await this.inbox.next(key, timeoutMs) }; } } await new Promise<void>((resolve: () => void): void => { setTimeout(resolve, 50); }); } throw new Error('timeout waiting for frame ' + keys.join(',')); } static key(frame: Uint8Array): number {
+
+class WireInbox {
+  private readonly inbox: GsFrameInbox<Uint8Array> = new GsFrameInbox<Uint8Array>();
+  private buffer: Uint8Array = new Uint8Array(0);
+  private queuedBytes: number = 0;
+  private failure?: Error;
+
+  push(chunk: Uint8Array): void {
+    if (this.failure !== undefined) { return; }
+    if (this.queuedBytes + this.buffer.length + chunk.length > 32 * 1024 * 1024) {
+      this.end(new Error('Quick Share 数据队列超过上限'), true);
+      return;
+    }
+    try {
+      this.buffer = GsBytes.concat([this.buffer, chunk]);
+      while (this.buffer.length >= 4) {
+        const len: number = GsBytes.readU32BE(this.buffer, 0);
+        if (len === 0 || len > 16 * 1024 * 1024) { throw new Error('Quick Share 无效帧长度'); }
+        if (this.buffer.length < len + 4) { return; }
+        const body: Uint8Array = this.buffer.slice(4, len + 4);
+        this.buffer = this.buffer.slice(len + 4);
+        const key: number = WireInbox.key(body);
+        this.queuedBytes += body.length + 4;
+        this.inbox.deliver(key, body);
+      }
+    } catch (error) {
+      this.end(error instanceof Error ? error : new Error(String(error)), true);
+    }
+  }
+
+  end(error: Error, discard: boolean = false): void {
+    if (this.failure !== undefined) { return; }
+    this.failure = error;
+    this.buffer = new Uint8Array(0);
+    if (discard) {
+      this.inbox.reset();
+      this.queuedBytes = 0;
+    } else {
+      this.inbox.rejectWaiters(error);
+    }
+  }
+
+  async next(key: number, timeoutMs: number = TIMEOUT): Promise<Uint8Array> {
+    if (this.failure !== undefined && this.inbox.queuedCount(key) === 0) { throw this.failure; }
+    const value: Uint8Array = await this.inbox.next(key, timeoutMs);
+    this.queuedBytes = Math.max(0, this.queuedBytes - value.length - 4);
+    return value;
+  }
+
+  queuedCount(key: number): number { return this.inbox.queuedCount(key); }
+  async nextAny(keys: number[]): Promise<WireFramePair> {
+    const deadline: number = Date.now() + TIMEOUT;
+    while (Date.now() < deadline) {
+      for (const key of keys) {
+        if (this.inbox.queuedCount(key) > 0) { return { key, value: await this.next(key) }; }
+      }
+      if (this.failure !== undefined) { throw this.failure; }
+      await new Promise<void>((resolve: () => void): void => { setTimeout(resolve, 50); });
+    }
+    throw new Error('timeout waiting for frame ' + keys.join(','));
+  }
+
+  static key(frame: Uint8Array): number {
     const type: number | undefined = ProtoReader.firstVarint(frame, 1);
     // UKEY2 messages (ClientInit=2, ServerInit=3, ClientFinish=4). An OfflineFrame
     // version is always 1, so 2..4 is unambiguous.
@@ -108,36 +226,114 @@ export class QuickShareChannel {
     }
   }
 
-  private async runSend(transport: GsTransport, device: GsDevice, files: GsOutgoingFile[], hooks: GsSendHooks, peerName: string): Promise<void> {
+  private async runSend(transport: GsTransport, device: GsDevice, files: GsOutgoingFile[], hooks: GsSendHooks,
+    peerName: string): Promise<void> {
     let t: GsTransport = transport;
-    const inbox = new WireInbox(); console.info("Quick Share sender TCP/stream ready, sending connection request"); t.onData((chunk: Uint8Array): void => inbox.push(chunk)); const handshake = new UKEY2Handshake("client"); await handshake.prepare();
-    let inboxRef: WireInbox = inbox;
-    const sendSharing: (bytes: Uint8Array) => Promise<void> = (bytes: Uint8Array): Promise<void> => t.send(bytes);
-    try { const localEndpointId: string = (hooks.localEndpointId !== undefined && hooks.localEndpointId.length === 4) ? hooks.localEndpointId : QuickShareChannel.peerEndpointId(device); console.info("Quick Share sender localEndpointId=" + localEndpointId + " " + device.name); const connectionRequest: Uint8Array = NearDropWire.connectionRequest(localEndpointId, peerName, NearDropWire.endpointInfo(peerName, await GsCrypto.randomBytes(16)), new Uint8Array(0)); console.info("Quick Share sender ConnectionRequest len=" + connectionRequest.length); await t.send(ProtoWire.frame(connectionRequest)); console.info("Quick Share sender sent ConnectionRequest"); const clientInit: Uint8Array = await handshake.buildClientInit(); await t.send(ProtoWire.frame(clientInit)); console.info("Quick Share sender sent ClientInit message_type=" + (ProtoReader.firstVarint(clientInit, 1) ?? -1) + " len=" + clientInit.length); console.info("Quick Share sender waiting ServerInit(103)/Alert(101)/ConnectionResponse(2)"); let serverInit: Uint8Array = await this.waitServerOrResponse(inboxRef); console.info("Quick Share sender got ServerInit len=" + serverInit.length); const finish: Uint8Array = await handshake.buildClientFinish(serverInit); await t.send(ProtoWire.frame(finish)); handshake.markVerified(); console.info("Quick Share sender sent ClientFinish, waiting ConnectionResponse"); const response: Uint8Array = await inboxRef.next(OfflineType.CONNECTION_RESPONSE); if ((ProtoReader.firstVarint(response, 3) ?? 0) === 2) throw new Error("connection rejected"); await t.send(ProtoWire.frame(NearDropWire.connectionAccept())); console.info("Quick Share sender sent ConnectionResponse (accept)");
-    if (hooks.forceWifiDirect === true && hooks.onWifiDirectTransport !== undefined) {
+    let inboxRef: WireInbox = new WireInbox();
+    const initialInbox: WireInbox = inboxRef;
+    t.onData((chunk: Uint8Array): void => initialInbox.push(chunk));
+    t.onClose?.((): void => initialInbox.end(new Error('Quick Share 对端已断开')));
+    const handshake: UKEY2Handshake = new UKEY2Handshake('client');
+    const send: (bytes: Uint8Array) => Promise<void> = (bytes: Uint8Array): Promise<void> => t.send(bytes);
+    const currentInbox: () => WireInbox = (): WireInbox => inboxRef;
+    const localEndpointId: string = hooks.localEndpointId !== undefined && hooks.localEndpointId.length === 4
+      ? hooks.localEndpointId : QuickShareChannel.peerEndpointId(device);
+    const acceptUpgrade = async (creds: WifiDirectUpgradeCredentials): Promise<boolean> => {
+      if (hooks.onWifiDirectTransport === undefined) { return false; }
+      let candidate: GsTransport | undefined;
       try {
-        console.info("Quick Share sender forcing Wi-Fi Direct upgrade");
-        await this.sendSharingFrame(sendSharing, handshake, BandwidthUpgrade.upgradePathRequest([BandwidthUpgradeMedium.WIFI_DIRECT]));
-        const avail: Uint8Array = await this.waitForUpgradeAvailable(inboxRef, handshake);
-        const creds: WifiDirectUpgradeCredentials | undefined = BandwidthUpgrade.parseWifiDirectCredentials(avail);
-        if (creds === undefined) throw new Error("peer did not offer Wi-Fi Direct credentials");
-        console.info("Quick Share sender got Wi-Fi Direct creds ssid=" + creds.ssid + " gateway=" + creds.gateway + " port=" + creds.port);
-        const newConn: GsStreamConnection | undefined = await hooks.onWifiDirectTransport(creds);
-        if (newConn === undefined) throw new Error("failed to join Wi-Fi Direct group");
-        const newTransport: GsTransport = new StreamTransport(newConn);
+        const conn: GsStreamConnection | undefined = await hooks.onWifiDirectTransport(creds);
+        if (conn === undefined) { throw new Error('未能加入 WLAN 直连组'); }
+        candidate = new StreamTransport(conn);
         const newInbox: WireInbox = new WireInbox();
-        newTransport.onData((chunk: Uint8Array): void => newInbox.push(chunk));
-        await newTransport.send(BandwidthUpgrade.clientIntroduction(localEndpointId));
-        await newInbox.next(OfflineType.BANDWIDTH_UPGRADE_NEGOTIATION); // CLIENT_INTRO_ACK
-        t = newTransport;
+        candidate.onData((chunk: Uint8Array): void => newInbox.push(chunk));
+        candidate.onClose?.((): void => newInbox.end(new Error('WLAN 直连连接已断开')));
+        await candidate.send(ProtoWire.frame(BandwidthUpgrade.clientIntroduction(localEndpointId)));
+        const ack: BandwidthUpgradeDecoded | undefined = BandwidthUpgrade.parse(
+          await newInbox.next(OfflineType.BANDWIDTH_UPGRADE_NEGOTIATION, P2P_UPGRADE_WAIT_MS));
+        if (ack?.eventType !== BandwidthUpgradeEvent.CLIENT_INTRODUCTION_ACK) {
+          throw new Error('未收到 WLAN 直连确认');
+        }
+        const previous: GsTransport = t;
+        t = candidate;
         inboxRef = newInbox;
-        void transport.close();
-        console.info("Quick Share sender migrated session to Wi-Fi Direct");
+        candidate = undefined;
+        void previous.close();
+        QuickShareChannel.reportTransport(hooks.onTransportChange, 'wifi-direct', true, '已升级 WLAN 直连');
+        return true;
       } catch (error) {
-        console.warn("Quick Share sender Wi-Fi Direct upgrade failed, staying on current transport: " + (error instanceof Error ? error.message : String(error)));
+        console.warn('Quick Share sender upgrade failed: ' + String(error));
+        QuickShareChannel.reportTransport(hooks.onTransportChange, 'wifi-lan', false,
+          'WLAN 直连升级失败，继续用当前通道');
+        return false;
+      } finally {
+        if (candidate !== undefined) { await candidate.close(); }
       }
+    };
+
+    try {
+      await handshake.prepare();
+      const connectionRequest: Uint8Array = NearDropWire.connectionRequest(localEndpointId, peerName,
+        NearDropWire.endpointInfo(peerName, await GsCrypto.randomBytes(16)), new Uint8Array(0));
+      await t.send(ProtoWire.frame(connectionRequest));
+      await t.send(ProtoWire.frame(await handshake.buildClientInit()));
+      const serverInit: Uint8Array = await this.waitServerOrResponse(inboxRef);
+      await t.send(ProtoWire.frame(await handshake.buildClientFinish(serverInit)));
+      handshake.markVerified();
+      const response: OfflineDecoded = NearDropWire.parseOfflineFrame(await inboxRef.next(OfflineType.CONNECTION_RESPONSE));
+      if ((ProtoReader.firstVarint(response.body, 3) ?? 0) === 2) { throw new Error('connection rejected'); }
+      await t.send(ProtoWire.frame(NearDropWire.connectionAccept()));
+
+      if (hooks.onPin !== undefined && !(await hooks.onPin(handshake.pin))) {
+        throw new Error('user cancelled pairing');
+      }
+      const pcPeer: boolean = hooks.pcPeer === true;
+      const payloadFiles: PayloadFile[] = files.map((file: GsOutgoingFile, index: number): PayloadFile => ({
+        name: file.name, size: file.size, mimeType: file.mime,
+        payloadId: pcPeer ? -NearDropWire.attachmentId() : index + 1
+      }));
+      const signedData: Uint8Array = await GsCrypto.randomBytes(72);
+      const secretIdHash: Uint8Array = await GsCrypto.randomBytes(6);
+      await this.sendSharingFrame(send, handshake, NearDropWire.pairedKeyEncryption(signedData, secretIdHash));
+      const peerEnc: SharingDecoded = await this.nextSharingFrame(currentInbox, handshake, acceptUpgrade);
+      if (peerEnc.type !== SharingType.PAIRED_KEY_ENCRYPTION) { throw new Error('expected paired key encryption from peer'); }
+      await this.sendSharingFrame(send, handshake, NearDropWire.pairedKeyResult());
+      const peerResult: SharingDecoded = await this.nextSharingFrame(currentInbox, handshake, acceptUpgrade);
+      if (peerResult.type !== SharingType.PAIRED_KEY_RESULT) { throw new Error('missing paired key result'); }
+
+      if (hooks.forceWifiDirect === true && hooks.onWifiDirectTransport !== undefined && t === transport) {
+        try {
+          await send(ProtoWire.frame(await handshake.encrypt(
+            BandwidthUpgrade.upgradePathRequest([BandwidthUpgradeMedium.WIFI_DIRECT]))));
+          const offer: Uint8Array = await this.waitForUpgradeAvailable(inboxRef, handshake);
+          const creds: WifiDirectUpgradeCredentials | undefined = BandwidthUpgrade.parseWifiDirectCredentials(offer);
+          if (creds !== undefined) { await acceptUpgrade(creds); }
+        } catch (error) {
+          console.warn('Quick Share sender could not negotiate WLAN Direct: ' + String(error));
+        }
+      }
+      await this.sendSharingFrame(send, handshake, NearDropWire.introduction(payloadFiles));
+      const introResponse: SharingDecoded = await this.nextSharingFrame(currentInbox, handshake, acceptUpgrade);
+      if (introResponse.type !== SharingType.RESPONSE) { throw new Error('missing sharing response'); }
+      const introStatus: number = ProtoReader.firstVarint(introResponse.body, 1) ?? 0;
+      if (introStatus !== 1) { throw new Error('transfer rejected status=' + introStatus); }
+      let total: number = 0;
+      for (const file of files) { total += file.size; }
+      let done: number = 0;
+      for (let index = 0; index < files.length; index++) {
+        await this.sendFile(t, handshake, files[index], payloadFiles[index], (delta: number): void => {
+          done += delta;
+          hooks.onProgress?.(total === 0 ? 100 : done * 100 / total);
+        });
+      }
+      const peerClosed: boolean = await this.waitForPeerDisconnect(inboxRef, handshake, 2000);
+      if (!peerClosed) {
+        try { await t.send(ProtoWire.frame(await handshake.encrypt(NearDropWire.disconnection(false)))); }
+        catch (error) { console.debug('Quick Share sender disconnect: ' + String(error)); }
+      }
+    } finally {
+      await t.close();
     }
-    const pinAccepted: boolean = hooks.onPin === undefined ? true : await hooks.onPin(handshake.pin); if (!pinAccepted) throw new Error("user cancelled pairing"); const pcPeer: boolean = hooks.pcPeer === true; const payloadFiles: PayloadFile[] = files.map((file: GsOutgoingFile, index: number): PayloadFile => ({ name: file.name, size: file.size, payloadId: pcPeer ? (-(Math.floor(Math.random() * 9007199254740991) + 1)) : index + 1, mimeType: file.mime })); console.info("Quick Share sender pcPeer=" + pcPeer + " payloadIds=" + payloadFiles.map((f: PayloadFile): string => String(f.payloadId)).join(',')); const signedData: Uint8Array = await GsCrypto.randomBytes(72); const secretIdHash: Uint8Array = await GsCrypto.randomBytes(6); await this.sendSharingFrame(sendSharing, handshake, NearDropWire.pairedKeyEncryption(signedData, secretIdHash)); const peerEnc: SharingDecoded = await this.nextSharingFrame(inboxRef, handshake); if (peerEnc.type !== SharingType.PAIRED_KEY_ENCRYPTION) throw new Error("expected paired key encryption from peer"); await this.sendSharingFrame(sendSharing, handshake, NearDropWire.pairedKeyResult()); const peerResult: SharingDecoded = await this.nextSharingFrame(inboxRef, handshake); if (peerResult.type !== SharingType.PAIRED_KEY_RESULT) throw new Error("missing paired key result"); await this.sendSharingFrame(sendSharing, handshake, NearDropWire.introduction(payloadFiles)); const introResponse: SharingDecoded = await this.nextSharingFrame(inboxRef, handshake); if (introResponse.type !== SharingType.RESPONSE) throw new Error("missing sharing response"); const introStatus: number = ProtoReader.firstVarint(introResponse.body, 1) ?? 0; if (introStatus !== 1) throw new Error("transfer rejected status=" + introStatus); let total: number = 0; for (const file of files) total += file.size; let done: number = 0; for (let index = 0; index < files.length; index++) { await this.sendFile(t, handshake, files[index], payloadFiles[index], (delta: number): void => { done += delta; if (hooks.onProgress !== undefined) hooks.onProgress(total === 0 ? 100 : done * 100 / total); }); } const peerClosed: boolean = await this.waitForPeerDisconnect(inboxRef, handshake, 2000); if (!peerClosed) { try { await t.send(ProtoWire.frame(await handshake.encrypt(NearDropWire.disconnection(false)))); } catch (closeErr) { console.debug("[QUICKSHARE] sender: best-effort disconnect ignored: " + (closeErr instanceof Error ? closeErr.message : String(closeErr))); } } } catch (error) { const message: string = error instanceof Error ? error.message : String(error); console.error("Quick Share sender: " + message); throw new Error(message); } finally { await t.close(); }
   }
   /**
    * After streaming the file bytes the receiver (Windows/Android Quick Share)
@@ -183,23 +379,53 @@ export class QuickShareChannel {
     await send(ProtoWire.frame(await handshake.encrypt(NearDropWire.payloadTransferEnvelope(sharingBytes, payloadId))));
     await send(ProtoWire.frame(await handshake.encrypt(NearDropWire.payloadTransferLastChunk(payloadId, sharingBytes.length))));
   }
-  private async nextSharingFrame(inbox: WireInbox, handshake: UKEY2Handshake): Promise<SharingDecoded> {
-    const buffers: Map<number, Uint8Array> = new Map<number, Uint8Array>();
+  private async nextSharingFrame(inbox: () => WireInbox, handshake: UKEY2Handshake,
+    acceptUpgrade?: (creds: WifiDirectUpgradeCredentials) => Promise<boolean>): Promise<SharingDecoded> {
+    const buffers: Map<string, Uint8Array> = new Map<string, Uint8Array>();
     for (;;) {
-      const offlineBytes: Uint8Array = await handshake.decrypt(await inbox.next(3));
+      const offlineBytes: Uint8Array = await handshake.decrypt(await inbox().next(3));
       const offline: OfflineDecoded = NearDropWire.parseOfflineFrame(offlineBytes);
       // Keep-alive frames are also SecureMessages and share the same key=3
       // bucket; skip them rather than treating them as a malformed payload.
       if (offline.type === OfflineType.KEEP_ALIVE) continue;
       if (offline.type === OfflineType.DISCONNECTION) throw new Error('peer disconnected during share');
+      // 对端可能**主动**下发升级（自从我们在 ConnectionRequest 里声明 mediums=[5,8] 后更容易发生）。
+      // 请求过升级（forceWifiDirect）的情况已在握手后处理；这里处理「对端自己发起」的情况：
+      // 接受则迁移会话，拒绝/失败都只是继续用当前通道，绝不中断本次传输。
+      if (offline.type === OfflineType.BANDWIDTH_UPGRADE_NEGOTIATION) {
+        const evt: BandwidthUpgradeDecoded | undefined = BandwidthUpgrade.parse(offlineBytes);
+        const eventType: number = evt === undefined ? -1 : evt.eventType;
+        let accepted: boolean = false;
+        if (eventType === BandwidthUpgradeEvent.UPGRADE_PATH_AVAILABLE && acceptUpgrade !== undefined) {
+          const creds: WifiDirectUpgradeCredentials | undefined =
+            BandwidthUpgrade.parseWifiDirectCredentials(offlineBytes);
+          if (creds !== undefined) {
+            accepted = await acceptUpgrade(creds);
+          } else {
+            // 对端可能只给了 device_name/PIN(WPS) 形态——明确说明原因，别静默失败。
+            const offer: WifiDirectCredentialOffer | undefined =
+              BandwidthUpgrade.inspectWifiDirectOffer(offlineBytes);
+            console.warn('[P2P] sender: peer upgrade offer unusable — '
+              + (offer === undefined ? 'no credentials message' : offer.detail));
+          }
+        }
+        console.info('[P2P] sender: peer bandwidth-upgrade event=' + eventType
+          + (accepted ? ' accepted, session migrated' : ' not accepted, staying on current transport'));
+        continue;
+      }
       if (offline.type !== OfflineType.PAYLOAD_TRANSFER) throw new Error('expected PayloadTransfer frame');
+      if (ProtoReader.firstVarint(offline.body, 1) !== PayloadPacket.DATA) { continue; }
       const pt: PayloadTransferDecoded = NearDropWire.parsePayloadTransfer(offline);
+      if (pt.idKey.length === 0 || (!buffers.has(pt.idKey) && buffers.size >= 8)) {
+        throw new Error('Quick Share 无效的控制消息 ID 或分片数');
+      }
       if (pt.type !== 1) throw new Error('expected BYTES payload');
-      let buf: Uint8Array = buffers.get(pt.id) ?? new Uint8Array(0);
+      let buf: Uint8Array = buffers.get(pt.idKey) ?? new Uint8Array(0);
+      if (buf.length + pt.body.length > 1024 * 1024) { throw new Error('Quick Share 控制消息超过上限'); }
       if (pt.body.length > 0) buf = GsBytes.concat([buf, pt.body]);
-      buffers.set(pt.id, buf);
+      buffers.set(pt.idKey, buf);
       if ((pt.flags & 1) !== 0) {
-        buffers.delete(pt.id);
+        buffers.delete(pt.idKey);
         console.info('[UKEY2] assembled PayloadTransfer id=' + pt.id + ' len=' + buf.length);
         return NearDropWire.parseSharing(buf);
       }
@@ -213,17 +439,36 @@ export class QuickShareChannel {
     // random value for callers that do not, so at least it is not the peer's id.
     return GsCrypto.createToken().slice(0, 4);
   }
+  /**
+   * 统一上报介质变化（发送侧与接收侧共用）。
+   * 升级是**静默**发生的：不主动上报的话，用户看不出「这次走的是局域网还是 WLAN 直连」。
+   * 回调可能不存在，也可能自己抛错——都不该影响协议流程。
+   */
+  static reportTransport(callback: ((change: GsTransportChange) => void) | undefined,
+    medium: string, upgraded: boolean, detail: string): void {
+    if (callback === undefined) {
+      return;
+    }
+    try {
+      callback({ medium: medium, upgraded: upgraded, detail: detail });
+    } catch (error) {
+      console.warn('[P2P] onTransportChange threw: ' + (error instanceof Error ? error.message : String(error)));
+    }
+  }
   private async waitServerOrResponse(inbox: WireInbox): Promise<Uint8Array> { for (let round = 0; round < 4; round++) { const frame: WireFramePair = await inbox.nextAny([103, 101, 2]); if (frame.key === 101) throw new Error('UKEY2 alert: ' + (ukey2Alert(frame.value) ?? 'unknown alert')); if (frame.key === 2) { const respBody: Uint8Array = NearDropWire.parseOfflineFrame(frame.value).body; const status: number = ProtoReader.firstVarint(respBody, 3) ?? 0; console.info('Quick Share sender got ConnectionResponse status=' + status); if (status === 2) throw new Error('connection rejected'); continue; } return frame.value; } throw new Error('did not receive ServerInit after connection response'); }
   private async waitForUpgradeAvailable(inbox: WireInbox, handshake: UKEY2Handshake): Promise<Uint8Array> {
-    for (;;) {
-      const offlineBytes: Uint8Array = await handshake.decrypt(await inbox.next(3));
-      const offline: OfflineDecoded = NearDropWire.parseOfflineFrame(offlineBytes);
+    const deadline: number = Date.now() + P2P_UPGRADE_WAIT_MS;
+    while (Date.now() < deadline) {
+      const bytes: Uint8Array = await handshake.decrypt(await inbox.next(3, Math.max(1, deadline - Date.now())));
+      const offline: OfflineDecoded = NearDropWire.parseOfflineFrame(bytes);
       if (offline.type === OfflineType.BANDWIDTH_UPGRADE_NEGOTIATION) {
-        return offlineBytes;
+        const event: BandwidthUpgradeDecoded | undefined = BandwidthUpgrade.parse(bytes);
+        if (event?.eventType === BandwidthUpgradeEvent.UPGRADE_PATH_AVAILABLE
+          || event?.eventType === BandwidthUpgradeEvent.UPGRADE_FAILURE) { return bytes; }
       }
-      if (offline.type === OfflineType.KEEP_ALIVE) continue;
-      if (offline.type === OfflineType.DISCONNECTION) throw new Error('peer disconnected during upgrade negotiation');
+      if (offline.type === OfflineType.DISCONNECTION) { throw new Error('peer disconnected during upgrade negotiation'); }
     }
+    throw new Error('等待 WLAN 直连凭据超时');
   }
   private async sendFile(transport: GsTransport, handshake: UKEY2Handshake, file: GsOutgoingFile, meta: PayloadFile, onDelta: (delta: number) => void): Promise<void> {
     // Register the FILE payload once (nearby::connections "Payload::File"): build
@@ -284,11 +529,13 @@ export class QuickShareChannel {
     fs.closeSync(w);
 
     const server = socket.constructTCPSocketServerInstance();
-      const testHooks: GsReceiveHooks = {
-        onIncomingSession: (_key: string, _peerName: string, _files: GsSessionFileMeta[], _pin: string): Promise<boolean> => Promise.resolve(true),
-        onFileReceived: (_file: GsIncomingFile): void => { return; },
-        onProgress: (_percent: number): void => { return; }
-      };
+    const testHooks: GsReceiveHooks = {
+      onIncomingSession: (_key: string, _peerName: string, _files: GsSessionFileMeta[], _pin: string): Promise<boolean> => Promise.resolve(true),
+      onFileReceived: async (_file: GsIncomingFile): Promise<void> => {
+        return;
+      },
+      onProgress: (_percent: number): void => { return; }
+    };
     server.on('connect', (conn: socket.TCPSocketConnection): void => {
       new QuickShareReceiver(context, 'app').run(new TcpReceiverConnection(conn), testHooks)
         .catch((error: Error): void => {
@@ -314,63 +561,120 @@ export class QuickShareChannel {
 
 
 export class QuickShareReceiver {
+  // TCP and BLE share the same app-level receive callbacks. Admit one transfer
+  // at a time until callbacks carry independent session identities.
+  private static activeSession: boolean = false;
   private static pendingUpgrade: Map<string, ReceiverSession> = new Map();
-  private tcpServer?: socket.TCPSocketServer; private readonly context: common.Context; private readonly saveMode: 'download' | 'app'; private state: QuickShareReceiverState = QuickShareReceiverState.initial; constructor(context: common.Context, saveMode: 'download' | 'app' = 'download') { this.context = context; this.saveMode = saveMode; }
+  private tcpServer?: socket.TCPSocketServer;
+  private readonly opening: Set<ReceiverConnection> = new Set<ReceiverConnection>();
+  private activeReceive?: ReceiverSession;
+  private state: QuickShareReceiverState = QuickShareReceiverState.initial;
+  private readonly context: common.Context;
+  private readonly saveMode: 'download' | 'app';
+
+  constructor(context: common.Context, saveMode: 'download' | 'app' = 'download') {
+    this.context = context;
+    this.saveMode = saveMode;
+  }
+
   async start(port: number, hooks: GsReceiveHooks, bindAddress?: string): Promise<void> {
-    console.info("Quick Share receiver listen begin port=" + port);
-    const server = socket.constructTCPSocketServerInstance();
-    server.on("connect", (conn: socket.TCPSocketConnection): void => {
-      console.info("Quick Share receiver accepted TCP connection");
-      const tcpConn: TcpReceiverConnection = new TcpReceiverConnection(conn);
-      conn.getRemoteAddress().then((peer: socket.NetAddress): void => {
-        console.info("Quick Share receiver remote=" + peer.address + ":" + peer.port);
-      }).catch((): void => undefined);
-      QuickShareReceiver.readFirstFrame(tcpConn).then((result: ReadFrameResult | undefined): void => {
-        if (result !== undefined && result.frame !== undefined) {
-          const evt = BandwidthUpgrade.parse(result.frame);
-          if (evt !== undefined && evt.eventType === BandwidthUpgradeEvent.CLIENT_INTRODUCTION) {
-            const session: ReceiverSession | undefined = QuickShareReceiver.pendingUpgrade.get(evt.endpointId);
-            if (session !== undefined) {
-              session.rewire(tcpConn);
-              session.inbox.push(result.raw.slice(4 + result.frame.length));
-              tcpConn.sendBytes(BandwidthUpgrade.clientIntroductionAck());
-              const r: (() => void) | undefined = session.upgradeResolve;
-              session.upgradeResolve = undefined;
-              if (r !== undefined) { r(); }
-              return;
-            }
-            console.warn("Quick Share receiver upgrade socket for unknown endpoint " + evt.endpointId);
-          }
-          this.run(tcpConn, hooks, result.raw).catch((error: Error): void => {
-            console.warn("Quick Share receiver: " + error.message);
-            conn.close().catch((): void => undefined);
-          });
-          return;
-        }
-        this.run(tcpConn, hooks).catch((error: Error): void => {
-          console.warn("Quick Share receiver: " + error.message);
-          conn.close().catch((): void => undefined);
-        });
-      }).catch((): void => {
-        this.run(tcpConn, hooks).catch((error: Error): void => console.warn("Quick Share receiver: " + error.message));
-      });
-    });
-    server.on("error", (error: Object): void => { console.warn("Quick Share receiver server error: " + JSON.stringify(error)); });
-    await server.listen({ address: bindAddress !== undefined && bindAddress.length > 0 ? bindAddress : "0.0.0.0", family: 1, port });
+    const server: socket.TCPSocketServer = socket.constructTCPSocketServerInstance();
     this.tcpServer = server;
-    console.info("Quick Share receiver listen ok port=" + port + " bind=" + (bindAddress !== undefined && bindAddress.length > 0 ? bindAddress : "0.0.0.0"));
-  }
-
-  stop(): void { if (this.tcpServer !== undefined) { this.tcpServer.off('connect'); this.tcpServer.close().catch((): void => undefined); this.tcpServer = undefined; } }
-  async run(conn: ReceiverConnection, hooks: GsReceiveHooks, seed?: Uint8Array): Promise<void> {
-    const session: ReceiverSession = new ReceiverSession(conn, hooks);
-    if (seed !== undefined && seed.length > 0) {
-      session.inbox.push(seed);
+    server.on('connect', (conn: socket.TCPSocketConnection): void => {
+      const tcpConn: TcpReceiverConnection = new TcpReceiverConnection(conn);
+      if (this.tcpServer !== server || this.opening.size >= 16) {
+        tcpConn.close();
+        return;
+      }
+      this.opening.add(tcpConn);
+      this.acceptConnection(tcpConn, hooks).catch((error: Error): void => {
+        console.warn('Quick Share receiver: ' + error.message);
+        tcpConn.close();
+      }).finally((): void => { this.opening.delete(tcpConn); });
+    });
+    server.on('error', (error: Object): void => { console.warn('Quick Share receiver server error: ' + JSON.stringify(error)); });
+    try {
+      await server.listen({ address: bindAddress !== undefined && bindAddress.length > 0 ? bindAddress : '0.0.0.0',
+        family: 1, port });
+      if (this.tcpServer !== server) { await server.close().catch((): void => undefined); }
+    } catch (error) {
+      if (this.tcpServer === server) { this.stop(); }
+      throw error as Error;
     }
-    await this.runSession(session, hooks);
   }
 
-  async runSession(session: ReceiverSession, hooks: GsReceiveHooks): Promise<void> {
+  private async acceptConnection(conn: ReceiverConnection, hooks: GsReceiveHooks): Promise<void> {
+    const result: ReadFrameResult | undefined = await QuickShareReceiver.readFirstFrame(conn);
+    if (result === undefined || !this.opening.has(conn)) { conn.close(); return; }
+    const event: BandwidthUpgradeDecoded | undefined = BandwidthUpgrade.parse(result.frame);
+    if (event?.eventType === BandwidthUpgradeEvent.CLIENT_INTRODUCTION) {
+      const session: ReceiverSession | undefined = QuickShareReceiver.pendingUpgrade.get(event.endpointId);
+      if (session === undefined || session.upgradeResolve === undefined) { conn.close(); return; }
+      // Only one candidate can claim the offer. Keep the original stream until the ACK is written.
+      QuickShareReceiver.pendingUpgrade.delete(event.endpointId);
+      await conn.sendBytes(ProtoWire.frame(BandwidthUpgrade.clientIntroductionAck()));
+      if (!this.opening.has(conn) || session.upgradeResolve === undefined) { conn.close(); return; }
+      const resolve: (migrated: boolean) => void = session.upgradeResolve;
+      session.upgradeResolve = undefined;
+      session.rewire(conn);
+      session.inbox.push(result.raw.slice(4 + result.frame.length));
+      resolve(true);
+      return;
+    }
+    await this.run(conn, hooks, result.raw);
+  }
+
+  stop(): void {
+    const server: socket.TCPSocketServer | undefined = this.tcpServer;
+    this.tcpServer = undefined;
+    if (server !== undefined) {
+      server.off('connect');
+      server.close().catch((): void => undefined);
+    }
+    this.opening.forEach((conn: ReceiverConnection): void => conn.close());
+    this.opening.clear();
+    this.activeReceive?.activeConn.close();
+    this.activeReceive?.upgradeResolve?.(false);
+  }
+
+  async run(conn: ReceiverConnection, hooks: GsReceiveHooks, seed?: Uint8Array,
+    proactiveUpgrade: boolean = false): Promise<void> {
+    let initial: Uint8Array | undefined = seed;
+    if (initial === undefined || initial.length === 0) {
+      const result: ReadFrameResult | undefined = await QuickShareReceiver.readFirstFrame(conn);
+      initial = result?.raw;
+    }
+    if (initial === undefined || initial.length < 5) { conn.close(); return; }
+    const length: number = GsBytes.readU32BE(initial, 0);
+    const first: OfflineDecoded | undefined = NearDropWire.tryParseOfflineFrame(initial.slice(4, length + 4));
+    if (first?.type !== OfflineType.CONNECTION_REQUEST) { conn.close(); return; }
+    if (QuickShareReceiver.activeSession) {
+      conn.close();
+      throw new Error('接收端正在处理另一个传输，请稍后重试');
+    }
+    QuickShareReceiver.activeSession = true;
+    const session: ReceiverSession = new ReceiverSession(conn, hooks);
+    this.activeReceive = session;
+    try {
+      session.inbox.push(initial);
+      await this.runSession(session, hooks, proactiveUpgrade);
+    } catch (error) {
+      if (session.accepted && session.consentKey.length > 0) {
+        hooks.onSessionFailed?.(session.consentKey, error instanceof Error ? error.message : String(error));
+      }
+      throw error as Error;
+    } finally {
+      if (QuickShareReceiver.pendingUpgrade.get(session.peerEndpointId) === session) {
+        QuickShareReceiver.pendingUpgrade.delete(session.peerEndpointId);
+      }
+      session.upgradeResolve?.(false);
+      this.activeReceive = undefined;
+      session.activeConn.close();
+      QuickShareReceiver.activeSession = false;
+    }
+  }
+
+  async runSession(session: ReceiverSession, hooks: GsReceiveHooks, proactiveUpgrade: boolean = false): Promise<void> {
     const handshake: UKEY2Handshake = session.handshake;
     const inbox: WireInbox = session.inbox;
     await handshake.prepare();
@@ -380,6 +684,28 @@ export class QuickShareReceiver {
     const requestBody: Uint8Array = NearDropWire.parseOfflineFrame(request).body;
     const peerEndpointB: Uint8Array = ProtoReader.firstBytes(requestBody, 1) ?? new Uint8Array(0);
     session.peerEndpointId = GsBytes.decodeText(peerEndpointB);
+    // 对端能力位（mediums/auth types/角色）：官方据此决定要不要选 Wi-Fi Direct，
+    // 我们据此决定要不要主动建组并下发 UPGRADE_PATH_AVAILABLE（docs/WIFI_DIRECT.md §2.4/§2.5）。
+    const capability: NearbyCapabilitySnapshot = NearbyCapabilities.read(requestBody);
+    console.info('[P2P] peer capability mediums=[' + capability.mediums.join(',') + '] authTypes=['
+      + capability.authTypes.join(',') + '] go=' + capability.supportsGroupOwner
+      + ' gc=' + capability.supportsGroupClient);
+    // 服务端主动升级的资格判定：对端声明了 WIFI_DIRECT、双方 P2P 凭据类型有交集、且调用方给了建组钩子。
+    // 满足就**现在开始在后台建组**（不阻塞握手与用户确认弹窗），凭据等确认通过后再发出去。
+    let upgradeOffer: Promise<WifiDirectUpgradeCredentials | undefined> | undefined = undefined;
+    const wantsProactive: boolean = proactiveUpgrade || hooks.proactiveWifiDirect === true;
+    if (wantsProactive && hooks.onUpgradeAvailable !== undefined
+      && NearbyCapabilities.supportsWifiDirect(capability) && NearbyCapabilities.hasCommonAuthType(capability)) {
+      console.info('[P2P] proactive upgrade armed: creating the group while the user confirms');
+      upgradeOffer = hooks.onUpgradeAvailable(capability.mediums)
+        .catch((error: Error): WifiDirectUpgradeCredentials | undefined => {
+          console.warn('[P2P] proactive group creation failed: ' + error.message);
+          return undefined;
+        });
+    } else if (wantsProactive) {
+      console.info('[P2P] proactive upgrade skipped: incompatible peer capabilities or missing hook'
+        + ' (mediums=[' + capability.mediums.join(',') + '] authTypes=[' + capability.authTypes.join(',') + '])');
+    }
     const peerNameBytes: Uint8Array = ProtoReader.firstBytes(requestBody, 2) ?? new Uint8Array(0);
     const endpointInfoBytes: Uint8Array = ProtoReader.firstBytes(requestBody, 6) ?? new Uint8Array(0);
     const infoName: string = GsBytes.cleanText(NearDropWire.endpointName(endpointInfoBytes));
@@ -417,39 +743,123 @@ export class QuickShareReceiver {
     this.state = QuickShareReceiverState.receivedPairedKeyResult;
     console.info("Quick Share receiver state=" + this.state);
     const metas: GsSessionFileMeta[] = [];
+    const ids: Set<string> = new Set<string>();
+    let total: number = 0;
     for (const raw of ProtoReader.allBytes(introduction.body, 1)) {
-      const nameBytes: Uint8Array = ProtoReader.firstBytes(raw, 1) ?? new Uint8Array(0);
-      const name: string = GsBytes.cleanText(GsBytes.decodeText(nameBytes));
-      console.info("Quick Share receiver file name decoded=[" + name + "]");
-      metas.push({ id: String(ProtoReader.firstVarint(raw, 3) ?? 0), name, size: ProtoReader.firstVarint(raw, 4) ?? 0 });
+      const id: string = ProtoReader.firstVarintKey(raw, 3) ?? '';
+      const name: string = GsBytes.cleanText(GsBytes.decodeText(ProtoReader.firstBytes(raw, 1) ?? new Uint8Array(0)));
+      const size: number = ProtoReader.firstVarint(raw, 4) ?? -1;
+      const mime: string = GsBytes.decodeText(ProtoReader.firstBytes(raw, 5) ?? new Uint8Array(0));
+      if (id.length === 0 || ids.has(id) || name.length === 0 || size < 0
+        || size >= Number.MAX_SAFE_INTEGER || !Number.isSafeInteger(total + size)) {
+        throw new Error('Quick Share 无效或重复的文件元数据');
+      }
+      ids.add(id);
+      total += size;
+      metas.push({ id, name, size, mime });
     }
+    if (metas.length === 0) { throw new Error('Quick Share 未收到文件元数据'); }
     const gate: string = GsCrypto.createToken();
     this.state = QuickShareReceiverState.waitingForUserConsent;
-    console.info("Quick Share receiver state=" + this.state);
-    const accepted: boolean = await hooks.onIncomingSession(gate, peerName, metas, handshake.pin);
-    await this.sendSharingFrame(sendSharing, handshake, NearDropWire.response(accepted));
-    if (!accepted) { this.state = QuickShareReceiverState.disconnected; return; }
-    this.state = QuickShareReceiverState.receivingFiles;
-    console.info("Quick Share receiver state=" + this.state);
-    let total: number = 0;
-    for (const item of metas) total += item.size;
-    let done: number = 0;
-    for (const meta of metas) {
-      const saved: GsIncomingFile = await this.receiveFile(inbox, handshake, meta, (delta: number): void => { done += delta; hooks.onProgress(total === 0 ? 100 : done * 100 / total); }, sendSharing, session);
-      hooks.onFileReceived(saved);
+    session.consentKey = gate;
+    session.accepted = await hooks.onIncomingSession(gate, peerName, metas, handshake.pin);
+    if (!session.accepted) {
+      await this.sendSharingFrame(sendSharing, handshake, NearDropWire.response(false));
+      this.state = QuickShareReceiverState.disconnected;
+      return;
     }
-    await session.send(ProtoWire.frame(await handshake.encrypt(NearDropWire.disconnection(false))));
-    this.state = QuickShareReceiverState.disconnected;
+    // Offer before ACCEPT so the sender is still reading negotiation frames.
+    if (!session.upgraded) { await this.offerWifiDirectUpgrade(session, handshake, sendSharing, upgradeOffer); }
+    await this.sendSharingFrame(sendSharing, handshake, NearDropWire.response(true));
+    this.state = QuickShareReceiverState.receivingFiles;
+    const received: GsIncomingFile[] = [];
+    let transferError: Error | undefined;
+    let done: number = 0;
+    try {
+      for (const meta of metas) {
+        const stageForSave: boolean = this.saveMode === 'download';
+        const saved: GsIncomingFile = await this.receiveFile(inbox, handshake, meta,
+          (delta: number): void => {
+            done += delta;
+            hooks.onProgress(total === 0 ? 99.9 : Math.min(99.9, done * 100 / total));
+          }, sendSharing, session, stageForSave);
+        received.push(saved);
+      }
+      try { await session.send(ProtoWire.frame(await handshake.encrypt(NearDropWire.disconnection(false)))); }
+      catch (error) { console.warn('Quick Share receiver could not send disconnect: ' + String(error)); }
+    } catch (error) {
+      transferError = error instanceof Error ? error : new Error(String(error));
+    }
+    // Network delivery must not wait for a SaveButton or media conversion.
     session.activeConn.close();
+    this.state = QuickShareReceiverState.disconnected;
+    for (const file of received) { await hooks.onFileReceived(file); }
+    if (transferError !== undefined) { throw transferError; }
+    hooks.onProgress(100);
   }
   private async sendSharingFrame(send: (bytes: Uint8Array) => Promise<void>, handshake: UKEY2Handshake, sharingBytes: Uint8Array): Promise<void> {
     const payloadId: number = Math.floor(Math.random() * 0x7fffffff) + 1;
     await send(ProtoWire.frame(await handshake.encrypt(NearDropWire.payloadTransferEnvelope(sharingBytes, payloadId))));
     await send(ProtoWire.frame(await handshake.encrypt(NearDropWire.payloadTransferLastChunk(payloadId, sharingBytes.length))));
   }
+
+  /**
+   * 服务端主动发起 Wi-Fi Direct 升级（官方角色模型：BWU initiator 是服务端，
+   * 见 `bwu_manager.cc::InitiateBwuForEndpoint()` —— 它直接发 UPGRADE_PATH_AVAILABLE，
+   * 不需要先收到 UPGRADE_PATH_REQUEST）。
+   *
+   * 流程：注册 pendingUpgrade → 发 UPGRADE_PATH_AVAILABLE（凭据）→ 等对端在新 socket 上发
+   * CLIENT_INTRODUCTION（由 `start()` 的 connect 处理器 rewire 本会话并 resolve）。
+   * 任何一步超时都只是"没升级"，不影响本次接收继续在旧通道上跑完。
+   */
+  private async offerWifiDirectUpgrade(session: ReceiverSession, handshake: UKEY2Handshake,
+    sendSharing: (bytes: Uint8Array) => Promise<void>,
+    pending: Promise<WifiDirectUpgradeCredentials | undefined> | undefined): Promise<void> {
+    if (pending === undefined) {
+      return;
+    }
+    const creds: WifiDirectUpgradeCredentials | undefined =
+      await QuickShareReceiver.withTimeout<WifiDirectUpgradeCredentials | undefined>(pending, P2P_GROUP_WAIT_MS);
+    if (creds === undefined || creds.gateway.length === 0) {
+      console.info('[P2P] proactive upgrade skipped: Wi-Fi Direct group not ready within '
+        + P2P_GROUP_WAIT_MS + 'ms');
+      return;
+    }
+    const migrated: boolean = await QuickShareReceiver.migrateReceiver(session, handshake, sendSharing, creds);
+    QuickShareChannel.reportTransport(session.hooks.onTransportChange,
+      migrated ? 'wifi-direct' : 'ble', migrated,
+      migrated ? '接收端已把会话迁移到 WLAN 直连' : '对端未在限定时间内加入直连组，继续用当前通道');
+  }
+
+  private static async migrateReceiver(session: ReceiverSession, handshake: UKEY2Handshake,
+    send: (bytes: Uint8Array) => Promise<void>, creds: WifiDirectUpgradeCredentials): Promise<boolean> {
+    if (session.upgraded || session.peerEndpointId.length !== 4) { return false; }
+    const waiter: Promise<boolean> = new Promise<boolean>((resolve: (migrated: boolean) => void): void => {
+      session.upgradeResolve = resolve;
+    });
+    const timer: number = setTimeout((): void => { session.upgradeResolve?.(false); }, P2P_UPGRADE_WAIT_MS);
+    QuickShareReceiver.pendingUpgrade.set(session.peerEndpointId, session);
+    try {
+      await send(ProtoWire.frame(await handshake.encrypt(BandwidthUpgrade.upgradePathAvailable(creds))));
+      return await waiter;
+    } finally {
+      clearTimeout(timer);
+      session.upgradeResolve = undefined;
+      if (QuickShareReceiver.pendingUpgrade.get(session.peerEndpointId) === session) {
+        QuickShareReceiver.pendingUpgrade.delete(session.peerEndpointId);
+      }
+    }
+  }
+
+  private static withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+    const timeout: Promise<T | undefined> = new Promise<T | undefined>((resolve: (value: T | undefined) => void): void => {
+      setTimeout((): void => resolve(undefined), timeoutMs);
+    });
+    return Promise.race([promise, timeout]);
+  }
   private async nextSharingFrame(inbox: WireInbox, handshake: UKEY2Handshake,
     sendSharing: (bytes: Uint8Array) => Promise<void>, session: ReceiverSession): Promise<SharingDecoded> {
-    const buffers: Map<number, Uint8Array> = new Map<number, Uint8Array>();
+    const buffers: Map<string, Uint8Array> = new Map<string, Uint8Array>();
     for (;;) {
       const offlineBytes: Uint8Array = await handshake.decrypt(await inbox.next(3));
       const offline: OfflineDecoded = NearDropWire.parseOfflineFrame(offlineBytes);
@@ -460,149 +870,141 @@ export class QuickShareReceiver {
       if (offline.type === OfflineType.KEEP_ALIVE) continue;
       if (offline.type === OfflineType.DISCONNECTION) throw new Error('peer disconnected during share');
       if (offline.type !== OfflineType.PAYLOAD_TRANSFER) throw new Error('expected PayloadTransfer frame');
+      if (ProtoReader.firstVarint(offline.body, 1) !== PayloadPacket.DATA) { continue; }
       const pt: PayloadTransferDecoded = NearDropWire.parsePayloadTransfer(offline);
+      if (pt.idKey.length === 0 || (!buffers.has(pt.idKey) && buffers.size >= 8)) {
+        throw new Error('Quick Share 无效的控制消息 ID 或分片数');
+      }
       if (pt.type !== 1) throw new Error('expected BYTES payload');
-      let buf: Uint8Array = buffers.get(pt.id) ?? new Uint8Array(0);
+      let buf: Uint8Array = buffers.get(pt.idKey) ?? new Uint8Array(0);
+      if (buf.length + pt.body.length > 1024 * 1024) { throw new Error('Quick Share 控制消息超过上限'); }
       if (pt.body.length > 0) buf = GsBytes.concat([buf, pt.body]);
-      buffers.set(pt.id, buf);
+      buffers.set(pt.idKey, buf);
       if ((pt.flags & 1) !== 0) {
-        buffers.delete(pt.id);
+        buffers.delete(pt.idKey);
         return NearDropWire.parseSharing(buf);
       }
     }
   }
   private async receiveFile(inbox: WireInbox, handshake: UKEY2Handshake, meta: GsSessionFileMeta,
     onDelta: (delta: number) => void, sendSharing: (bytes: Uint8Array) => Promise<void>,
-    session: ReceiverSession): Promise<GsIncomingFile> {
-    const safe: string = meta.name.replace(/[\\/:*?"<>|]/g, '_');
-    let target: string;
-    let handle: fs.File;
-    // Save via DocumentViewPicker DOWNLOAD mode: it returns the Download/<bundle>
-    // DIRECTORY uri; convert it to a real path with fileUri.FileUri().path and
-    // create the file inside. The picker grants access to the public Download
-    // directory for the chosen file, so no WRITE_MEDIA permission is required.
-    // Fall back to app storage when the picker is unavailable (self-test / headless).
-    if (this.saveMode === 'download') {
-      try {
-        const options: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
-        options.pickerMode = picker.DocumentPickerMode.DOWNLOAD;
-        options.newFileNames = [safe];
-        const documentViewPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker();
-        const uris: string[] = await documentViewPicker.save(options);
-        const basePath: string = new fileUri.FileUri(uris[0]).path;
-        target = basePath.endsWith('/') ? basePath + safe : basePath + '/' + safe;
-        console.info('Quick Share receiver writing to Download dir: ' + (target.lastIndexOf('/') >= 0 ? target.substring(0, target.lastIndexOf('/')) : target));
-        handle = fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      } catch (error) {
-        console.warn('Quick Share receiver DocumentViewPicker save failed, falling back to app storage: ' + (error instanceof Error ? error.message : JSON.stringify(error)));
-        const dir: string = this.context.filesDir + '/Download';
-        if (!fs.accessSync(dir)) fs.mkdirSync(dir, true);
-        target = dir + '/' + Date.now() + '-' + safe;
-        handle = fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      }
-    } else {
-      const dir: string = this.context.filesDir + '/Download';
-      if (!fs.accessSync(dir)) fs.mkdirSync(dir, true);
-      target = dir + '/' + Date.now() + '-' + safe;
-      handle = fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-    }
+    session: ReceiverSession, stageForSave: boolean): Promise<GsIncomingFile> {
+    const cleaned = meta.name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_');
+    const safe = cleaned.length === 0 || cleaned === '.' || cleaned === '..' ||
+      GsBytes.encodeText(cleaned).length > 220 ? 'received-file' : cleaned;
+    const dir = this.context.filesDir + (stageForSave ? '/incoming/quickshare' : '/Download');
+    if (!fs.accessSync(dir)) { fs.mkdirSync(dir, true); }
+    const target = QuickShareReceiver.uniqueTarget(dir, safe);
+    const handle = fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE);
     let offset: number = 0;
+    let complete: boolean = false;
     try {
-      // Read until the LAST_CHUNK flag, not until a declared size: if the peer's
-      // Introduction size were smaller than the bytes actually sent, exiting on
-      // offset>=meta.size would silently truncate the file. size is only an upper
-      // bound / final verification.
-      while (true) {
+      for (;;) {
         const raw: Uint8Array = await handshake.decrypt(await inbox.next(3));
-        let decoded: PayloadDecoded | undefined = undefined;
-        try {
-          const offline: OfflineDecoded = NearDropWire.parseOfflineFrame(raw);
-          if (offline.type === OfflineType.BANDWIDTH_UPGRADE_NEGOTIATION) {
-            await this.handleUpgrade(sendSharing, session, raw);
-            continue;
-          }
-          if (offline.type === OfflineType.KEEP_ALIVE) continue;
-          if (offline.type === OfflineType.DISCONNECTION) throw new Error('peer disconnected during transfer');
-          if (offline.type !== OfflineType.PAYLOAD_TRANSFER) {
-            console.info('Quick Share receiver skipping non-PAYLOAD frame type=' + offline.type);
-            continue;
-          }
-          decoded = NearDropWire.parsePayload(raw);
-        } catch (error) {
-          console.info('Quick Share receiver skipped unparseable frame: ' + (error instanceof Error ? error.message : String(error)));
+        const offline: OfflineDecoded = NearDropWire.parseOfflineFrame(raw);
+        if (offline.type === OfflineType.BANDWIDTH_UPGRADE_NEGOTIATION) {
+          await this.handleUpgrade(sendSharing, session, raw);
           continue;
         }
-        // Only FILE payloads carry file bytes; BYTES payloads / CertificateInfo /
-        // keep-alives during the file phase must be skipped, not written to disk.
-        if (decoded.type !== 2) {
-          console.info('Quick Share receiver skipped BYTES payload id=' + decoded.id + ' total=' + decoded.totalSize + ' len=' + decoded.body.length);
-          continue;
+        if (offline.type === OfflineType.DISCONNECTION) { throw new Error('peer disconnected during transfer'); }
+        if (offline.type !== OfflineType.PAYLOAD_TRANSFER
+          || ProtoReader.firstVarint(offline.body, 1) !== PayloadPacket.DATA) { continue; }
+        const decoded: PayloadDecoded = NearDropWire.parsePayload(raw);
+        if (decoded.type !== 2) { continue; }
+        if (decoded.idKey !== meta.id || decoded.totalSize !== meta.size
+          || decoded.offset > offset || decoded.offset + decoded.body.length > meta.size
+          || (decoded.offset < offset && !session.upgraded)) {
+          throw new Error('Quick Share 文件标识、偏移或大小与接收请求不符');
         }
-        if (decoded.offset !== offset || offset + decoded.body.length > meta.size) {
-          console.error('Quick Share receiver mismatch offset=' + decoded.offset + '/exp=' + offset + ' total=' + decoded.totalSize + '/metaSize=' + meta.size + ' len=' + decoded.body.length + ' id=' + decoded.id + '/metaId=' + meta.id);
-          throw new Error('payload offset/size mismatch');
+        const body: Uint8Array = decoded.body.slice(Math.min(decoded.body.length, offset - decoded.offset));
+        let written: number = 0;
+        while (written < body.length) {
+          const count: number = await fs.write(handle.fd, GsBytes.toArrayBuffer(body.slice(written)));
+          if (count <= 0 || count > body.length - written) { throw new Error('接收文件写入不完整'); }
+          written += count;
+          offset += count;
+          onDelta(count);
         }
-        if (decoded.body.length > 0) { await fs.write(handle.fd, GsBytes.toArrayBuffer(decoded.body)); offset += decoded.body.length; onDelta(decoded.body.length); }
-        if ((decoded.flags & 1) !== 0) break;
-        if (meta.size === 0) break;
+        if ((decoded.flags & 1) !== 0) {
+          if (offset !== meta.size || decoded.offset + decoded.body.length !== meta.size) {
+            throw new Error('payload ended before declared size');
+          }
+          break;
+        }
       }
-      if (offset !== meta.size) throw new Error('payload ended before declared size');
-    } finally { fs.closeSync(handle); }
-    return { name: meta.name, size: offset, savedPath: target };
+      complete = true;
+    } finally {
+      try { fs.closeSync(handle); }
+      finally {
+        if (!complete) {
+          try { fs.unlinkSync(target); } catch (error) { console.warn('Quick Share partial file cleanup failed'); }
+        }
+      }
+    }
+    return {
+      name: meta.name,
+      size: offset,
+      savedPath: target,
+      mime: meta.mime,
+      stagedForSave: stageForSave
+    };
   }
 
-  private async handleUpgrade(sendSharing: (bytes: Uint8Array) => Promise<void>,
-    session: ReceiverSession, offlineBytes: Uint8Array): Promise<void> {
-    const evt: BandwidthUpgradeDecoded | undefined = BandwidthUpgrade.parse(offlineBytes);
-    if (evt === undefined || evt.eventType !== BandwidthUpgradeEvent.UPGRADE_PATH_REQUEST) {
-      return;
+  private static uniqueTarget(directory: string, name: string): string {
+    const prefix: string = directory.endsWith('/') ? directory : directory + '/';
+    const dot: number = name.lastIndexOf('.');
+    const stem: string = dot > 0 ? name.substring(0, dot) : name;
+    const extension: string = dot > 0 ? name.substring(dot) : '';
+    for (let index: number = 0; index < 10000; index++) {
+      const candidate: string = prefix + stem + (index === 0 ? '' : ' (' + index + ')') + extension;
+      if (!fs.accessSync(candidate)) {
+        return candidate;
+      }
     }
+    throw new Error('无法分配不重名的接收文件');
+  }
+
+  private async handleUpgrade(send: (bytes: Uint8Array) => Promise<void>,
+    session: ReceiverSession, offlineBytes: Uint8Array): Promise<void> {
+    const event: BandwidthUpgradeDecoded | undefined = BandwidthUpgrade.parse(offlineBytes);
+    if (event?.eventType !== BandwidthUpgradeEvent.UPGRADE_PATH_REQUEST || session.upgraded) { return; }
     const hook: ((mediums: number[]) => Promise<WifiDirectUpgradeCredentials | undefined>) | undefined =
       session.hooks.onUpgradeAvailable;
-    const creds: WifiDirectUpgradeCredentials | undefined = hook === undefined ? undefined : await hook(evt.mediums);
-    if (creds === undefined) {
-      await this.sendSharingFrame(sendSharing, session.handshake,
-        BandwidthUpgrade.upgradeFailure(BandwidthUpgradeMedium.WIFI_DIRECT));
+    const credentials: WifiDirectUpgradeCredentials | undefined = hook === undefined ? undefined :
+      await QuickShareReceiver.withTimeout(hook(event.mediums), P2P_GROUP_WAIT_MS);
+    if (credentials === undefined) {
+      await send(ProtoWire.frame(await session.handshake.encrypt(
+        BandwidthUpgrade.upgradeFailure(BandwidthUpgradeMedium.WIFI_DIRECT))));
       return;
     }
-    QuickShareReceiver.pendingUpgrade.set(session.peerEndpointId, session);
-    await this.sendSharingFrame(sendSharing, session.handshake,
-      BandwidthUpgrade.upgradePathAvailable(creds));
-    // Wait for the peer to open the Wi-Fi Direct socket; the server's connect
-    // handler rewires this session and resolves upgradeResolve.
-    if (session.upgradeResolve === undefined) {
-      const waiter: Promise<void> = new Promise<void>((resolve: () => void): void => {
-        session.upgradeResolve = resolve;
-      });
-      const timeout: Promise<void> = new Promise<void>((resolve: () => void): void => {
-        setTimeout(resolve, 15000);
-      });
-      await Promise.race([waiter, timeout]);
-    }
+    const migrated: boolean = await QuickShareReceiver.migrateReceiver(session, session.handshake, send, credentials);
+    QuickShareChannel.reportTransport(session.hooks.onTransportChange, migrated ? 'wifi-direct' : 'wifi-lan', migrated,
+      migrated ? '已按对端请求升级到 WLAN 直连' : '对端未在限定时间内加入直连组，继续用当前通道');
   }
 
-  private static async readFirstFrame(conn: ReceiverConnection): Promise<ReadFrameResult | undefined> {
+  private static readFirstFrame(conn: ReceiverConnection): Promise<ReadFrameResult | undefined> {
     return new Promise<ReadFrameResult | undefined>((resolve) => {
       let buf: Uint8Array = new Uint8Array(0);
       let done: boolean = false;
-      const finish = (value: ReadFrameResult | undefined): void => {
-        if (!done) {
-          done = true;
-          resolve(value);
-        }
+      let timer: number = -1;
+      const finish = (result: ReadFrameResult | undefined): void => {
+        if (done) { return; }
+        done = true;
+        clearTimeout(timer);
+        resolve(result);
       };
+      timer = setTimeout((): void => finish(undefined), 3000);
+      conn.onClose?.((): void => finish(undefined));
       conn.onData((chunk: Uint8Array): void => {
+        if (done) { return; }
+        // The first message is small: ConnectionRequest or CLIENT_INTRODUCTION.
+        if (buf.length + chunk.length > 1024 * 1024) { finish(undefined); return; }
         buf = GsBytes.concat([buf, chunk]);
-        if (buf.length >= 4) {
-          const len: number = ((buf[0] * 0x1000000) + (buf[1] << 16) + (buf[2] << 8) + buf[3]) >>> 0;
-          if (len > 16 * 1024 * 1024 || buf.length >= len + 4) {
-            const frame: Uint8Array = buf.slice(4, Math.min(len + 4, buf.length));
-            const result: ReadFrameResult = { frame: frame, raw: buf };
-            finish(result);
-          }
-        }
+        if (buf.length < 4) { return; }
+        const len: number = GsBytes.readU32BE(buf, 0);
+        if (len === 0 || len > 64 * 1024) { finish(undefined); return; }
+        if (buf.length >= len + 4) { finish({ frame: buf.slice(4, len + 4), raw: buf }); }
       });
-      setTimeout((): void => finish(undefined), 3000);
     });
   }
 }

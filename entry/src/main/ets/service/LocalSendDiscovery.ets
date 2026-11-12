@@ -8,8 +8,10 @@ import { ByteUtils } from '../common/ByteUtils';
 import { SecurityUtils } from '../common/SecurityUtils';
 import { SettingsStore } from '../common/SettingsStore';
 import { DeviceEndpoint } from '../model/TransferModels';
-import { getLocalIpv4 } from '../common/NetAddress';
+import { getLocalIpv4, isLocalIpv4Address } from '../common/NetAddress';
+import { AdvertisementIdentity } from '../common/AdvertisementIdentity';
 import { MulticastDiscovery } from './MulticastDiscovery';
+import { NetDiscoveryNative } from './NetDiscoveryNative';
 import { LocalSendSubnetScanner } from './LocalSendSubnetScanner';
 
 type DeviceListener = (device: DeviceEndpoint) => void;
@@ -22,6 +24,12 @@ const EMIT_THROTTLE_MS = 3000;
 const MAP_PRUNE_INTERVAL_MS = 60000;
 const SEEN_TTL_MS = 300000;
 
+// One advertised instance name per device, persisted across launches (see
+// AdvertisementIdentity). The system mdns daemon keeps every registration alive
+// beyond the app process - the device log showed 63 LocalSend registrations and
+// 0 removals, which is what filled peers' lists with duplicate "羊绒互传" devices.
+const MDNS_SERVICE_INSTANCE_DUPLICATED = 2204007;
+
 export class LocalSendDiscovery {
   private readonly listeners: Set<DeviceListener> = new Set();
   private readonly seen: Map<string, number> = new Map();
@@ -31,6 +39,9 @@ export class LocalSendDiscovery {
 
   private serviceActive = false;
   private scanning = false;
+  private scanGeneration = 0;
+  private advertisementGeneration = 0;
+  private advertisementOperation: Promise<void> = Promise.resolve();
   private advertisedOnce = false;
   private advertising = false;
   private fingerprint: string = '';
@@ -50,12 +61,32 @@ export class LocalSendDiscovery {
     this.multicast = new MulticastDiscovery((device: DeviceEndpoint): void => this.emit(device),
       (address: string): boolean => this.localAddresses.has(address),
       (): string => this.localAddress);
-    this.localSendSubnet = new LocalSendSubnetScanner((device: DeviceEndpoint): void => this.emit(device),
-      (address: string): boolean => this.localAddresses.has(address));
+    // 子网扫描走 emitExternal（带本机指纹过滤）：热点网段扫描必然探到热点地址上的本机服务
+    // （192.168.43.1:53317 = 自己），而 localAddresses（getAllNetsSync 枚举）看不到 SoftAP，
+    // scanner 的地址自识别拦不住它 —— 只能靠指纹拦（2026-09-20 真机：自己以「羊绒互传」上屏）。
+    this.localSendSubnet = new LocalSendSubnetScanner((device: DeviceEndpoint): void => this.emitExternal(device),
+      (address: string): boolean => this.localAddresses.has(address), context);
   }
 
   addListener(listener: DeviceListener): void {
     this.listeners.add(listener);
+  }
+
+  /**
+   * 非发现模块入口上报的对端（HTTP 服务端把 register / send-request 信号转进来）。
+   * 与组播/扫描路径共用去重与回调管线；本机指纹/本机地址过滤照旧，
+   * 防止自连探测、本机访问自己的服务时把自己上屏。
+   */
+  emitExternal(device: DeviceEndpoint): void {
+    if (this.fingerprint.length > 0 && device.fingerprint.length > 0
+      && device.fingerprint === this.fingerprint) {
+      Lg.i(LOG_TAG + ': ignored own device via fingerprint (http signal ' + device.address + ')');
+      return;
+    }
+    if (this.isOwnService(device.name, device.address)) {
+      return;
+    }
+    this.emit(device);
   }
 
   removeListener(listener: DeviceListener): void {
@@ -64,6 +95,11 @@ export class LocalSendDiscovery {
 
   getLocalAddress(): string {
     return this.localAddress;
+  }
+
+  /** 发现链路的健康提示（空串 = 正常）；供页面显示「为什么搜不到对端」。 */
+  statusHint(): string {
+    return this.multicast.statusHint();
   }
 
   isVisible(): boolean {
@@ -137,13 +173,9 @@ export class LocalSendDiscovery {
       return;
     }
     this.scanning = true;
+    this.scanGeneration += 1;
     this.refreshLocalNetwork();
-    // 扫描期间临时提升本机可见性，保证对端能发现本机（尤其 alwaysVisible=false 时）。
-    // 退出本地 LocalSend 页后由 stopScan() 根据设置恢复。
-    if (!this.advertising) {
-      this.setVisible(true);
-      Lg.i(LOG_TAG + ': scanning enabled temporary visibility');
-    }
+    this.setVisible(SettingsStore.current().alwaysVisible);
     this.startMdnsDiscovery();
     this.startSubnetScan();
     // 立即广播一次 announce，让在线对端马上回包，卡片无需等下一个 5s 定时。
@@ -151,7 +183,7 @@ export class LocalSendDiscovery {
     // 自连本机 IP:53317：区分“服务端没起来”还是“对端到不了本机”。
     const selfAddr = this.localAddress;
     if (selfAddr.length > 0) {
-      void this.localSendSubnet.probeSelf(selfAddr).then((ok: boolean): void => {
+      void this.localSendSubnet.probeSelf(selfAddr, this.httpsEnabled).then((ok: boolean): void => {
         Lg.i(LOG_TAG + ': self-test ' + selfAddr + ':53317 -> '
           + (ok ? 'OK (LocalSend server listening)' : 'FAIL (server not reachable)'));
       });
@@ -165,6 +197,8 @@ export class LocalSendDiscovery {
       return;
     }
     this.scanning = false;
+    this.scanGeneration += 1;
+    this.localSendSubnet.stop();
     if (this.subnetScanTimer !== -1) {
       clearInterval(this.subnetScanTimer);
       this.subnetScanTimer = -1;
@@ -177,7 +211,6 @@ export class LocalSendDiscovery {
       }
       this.discoveryService = undefined;
     }
-    // 结束后恢复系统设置中的可见性，而不是把临时广播一直留着。
     this.setVisible(SettingsStore.current().alwaysVisible);
     this.seen.clear();
     Lg.i(LOG_TAG + ': scanning stopped');
@@ -185,6 +218,8 @@ export class LocalSendDiscovery {
 
   stop(): void {
     this.scanning = false;
+    this.scanGeneration += 1;
+    this.localSendSubnet.stop();
     if (this.subnetScanTimer !== -1) {
       clearInterval(this.subnetScanTimer);
       this.subnetScanTimer = -1;
@@ -215,19 +250,29 @@ export class LocalSendDiscovery {
   private startSubnetScan(): void {
     const scan = (): void => {
       this.refreshLocalNetwork();
-      // 只扫描“可用于发现对端的局域网”网段，避免把本机容器/VPN 网卡（如 172.17.1.1）也当成子网扫描，
+      // 只扫描“可用于发现对端的局域网”网段，避免把本机容器/VPN 网卡（如 192.0.2.10）也当成子网扫描，
       // 那只会反复探测虚拟子网、拖慢扫描。localAddresses 仍保留全部网卡地址，用于自识别。
-      const addresses: string[] = [];
+      const addressSet: Set<string> = new Set();
       for (const addr of this.localAddresses) {
         if (this.isLanScannerAddress(addr)) {
-          addresses.push(addr);
+          addressSet.add(addr);
         }
       }
+      // 热点网卡地址必须显式并入：SoftAP 不出现在 getAllNetsSync() 的枚举里，开热点时
+      // 系统默认网络又是蜂窝，localAddresses 里只剩 10.x —— 按老逻辑会去扫蜂窝 /24，
+      // 连着热点的对端（192.168.43.x）一台都扫不到（2026-09-20 真机日志实证）。
+      // native getifaddrs() 能枚举到热点网卡，扫描它的 /24 即可覆盖对端。
+      for (const iface of NetDiscoveryNative.hotspotInterfaces()) {
+        if (this.isLanScannerAddress(iface.address)) {
+          addressSet.add(iface.address);
+        }
+      }
+      const addresses: string[] = Array.from(addressSet);
       if (addresses.length === 0 && this.localAddress.length > 0) {
         addresses.push(this.localAddress);
       }
       Lg.i(LOG_TAG + ': subnet scan round over addresses=[' + addresses.join(', ') + '] (port 53317)');
-      void this.scanLocalSendAddresses(addresses);
+      void this.scanLocalSendAddresses(addresses, this.scanGeneration);
     };
     scan();
     this.subnetScanTimer = setInterval(scan, 20000);
@@ -283,11 +328,14 @@ export class LocalSendDiscovery {
     return false;
   }
 
-  private async scanLocalSendAddresses(addresses: string[]): Promise<void> {
+  private async scanLocalSendAddresses(addresses: string[], generation: number): Promise<void> {
     if (addresses.length === 0) {
       return;
     }
     for (const address of addresses) {
+      if (!this.scanning || generation !== this.scanGeneration) {
+        return;
+      }
       try {
         await this.localSendSubnet.scan(address);
         Lg.i(LOG_TAG + ': subnet scan round done for ' + address);
@@ -299,9 +347,12 @@ export class LocalSendDiscovery {
 
   private startMdnsDiscovery(): void {
     try {
+      const generation = this.scanGeneration;
       const service = mdns.createDiscoveryService(this.context, LOCALSEND_SERVICE_TYPE);
       service.on('serviceFound', (info: mdns.LocalServiceInfo): void => {
-        this.resolveMdnsService(info);
+        if (this.scanning && generation === this.scanGeneration) {
+          this.resolveMdnsService(info);
+        }
       });
       service.startSearchingMDNS();
       this.discoveryService = service;
@@ -312,7 +363,11 @@ export class LocalSendDiscovery {
   }
 
   private resolveMdnsService(info: mdns.LocalServiceInfo): void {
+    const generation = this.scanGeneration;
     mdns.resolveLocalService(this.context, info).then((resolved: mdns.LocalServiceInfo): void => {
+      if (!this.scanning || generation !== this.scanGeneration) {
+        return;
+      }
       const host = resolved.host;
       if (host === undefined || host.address === undefined || host.address.length === 0) {
         return;
@@ -375,11 +430,9 @@ export class LocalSendDiscovery {
   }
 
   private startMdnsAdvertisement(): void {
-    if (this.advertisedService !== undefined) {
-      return;
-    }
+    const generation = ++this.advertisementGeneration;
     const settings = SettingsStore.current();
-    const suffix = SecurityUtils.createToken().slice(0, 6);
+    const suffix = AdvertisementIdentity.localSendInstanceSuffix(this.context);
     const serviceName = OWN_SERVICE_PREFIX + suffix;
     this.advertisedServiceName = serviceName;
     const fingerprint = this.fingerprint.length > 0 ? this.fingerprint : suffix;
@@ -401,24 +454,41 @@ export class LocalSendDiscovery {
         { key: 'fingerprint', value: Array.from(ByteUtils.encodeText(fingerprint)) }
       ]
     };
-    mdns.addLocalService(this.context, serviceInfo).then((added: mdns.LocalServiceInfo): void => {
+    this.advertisementOperation = this.advertisementOperation.then(async (): Promise<void> => {
+      if (!this.advertising || generation !== this.advertisementGeneration) {
+        return;
+      }
+      let added: mdns.LocalServiceInfo;
+      try {
+        added = await mdns.addLocalService(this.context, serviceInfo);
+      } catch (error) {
+        if ((error as BusinessError).code !== MDNS_SERVICE_INSTANCE_DUPLICATED) {
+          throw error instanceof Error ? error : new Error(JSON.stringify(error));
+        }
+        added = serviceInfo;
+      }
       this.advertisedService = added;
-      Lg.i(LOG_TAG + ': mDNS advertisement added as ' + serviceName + ' on port ' + this.servicePort);
+      if (!this.advertising || generation !== this.advertisementGeneration) {
+        await mdns.removeLocalService(this.context, added);
+        this.advertisedService = undefined;
+      }
     }).catch((error: BusinessError): void => {
-      this.advertisedServiceName = '';
-      Lg.w(LOG_TAG + ': mDNS advertise failed: ' + JSON.stringify(error));
+      Lg.w(LOG_TAG + ': mDNS advertise/update failed: ' + JSON.stringify(error));
     });
   }
 
   private stopMdnsAdvertisement(): void {
-    if (this.advertisedService !== undefined) {
-      const service = this.advertisedService;
-      this.advertisedService = undefined;
-      mdns.removeLocalService(this.context, service).catch((error: BusinessError): void => {
-        Lg.w(LOG_TAG + ': mDNS unadvertise failed: ' + JSON.stringify(error));
-      });
-    }
+    this.advertisementGeneration += 1;
     this.advertisedServiceName = '';
+    this.advertisementOperation = this.advertisementOperation.then(async (): Promise<void> => {
+      const service = this.advertisedService;
+      if (service !== undefined) {
+        await mdns.removeLocalService(this.context, service);
+        this.advertisedService = undefined;
+      }
+    }).catch((error: BusinessError): void => {
+      Lg.w(LOG_TAG + ': mDNS unadvertise failed: ' + JSON.stringify(error));
+    });
   }
 
   private emit(device: DeviceEndpoint): void {
@@ -506,6 +576,14 @@ export class LocalSendDiscovery {
     const normalized = serviceName.trim().replace(/\.$/, '');
     const own = this.advertisedServiceName.trim().replace(/\.$/, '');
     if (own.length > 0 && normalized === own) {
+      return true;
+    }
+    // Address check against *every* local interface, including the VPN/container
+    // segments that localAddresses deliberately excludes (192.0.2.10 = 卓易通's
+    // virtual gateway). Our own advertisement is echoed back from that interface
+    // too, and those copies are the ones that used to pile up in the device list.
+    if (isLocalIpv4Address(address)) {
+      Lg.i(LOG_TAG + ': ignored own device at local address ' + address);
       return true;
     }
     return this.localAddresses.has(address);

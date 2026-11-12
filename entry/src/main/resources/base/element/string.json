@@ -1,15 +1,300 @@
 {
   "string": [
-    { "name": "module_desc", "value": "羊绒互传主模块" },
-    { "name": "ability_desc", "value": "羊绒互传入口能力" },
-    { "name": "service_desc", "value": "Nearby discovery and receive service" },
-    { "name": "permission_internet", "value": "用于局域网本地传输。" },
-    { "name": "permission_network_info", "value": "用于显示本地传输地址。" },
-    { "name": "permission_wifi", "value": "用于创建 Wi-Fi 直连传输。" },
-    { "name": "permission_location", "value": "系统要求的定位权限，用于附近设备发现。" },
-    { "name": "permission_bluetooth", "value": "用于发现附近兼容设备。" },
-    { "name": "permission_background", "value": "让接收服务在后台持续运行。" },
-    { "name": "permission_bundle", "value": "用于标识本应用。" },
-    { "name": "permission_keep_background_running", "value": "用于通过长时任务在后台持续接收文件。" }
+    {
+      "name": "module_desc",
+      "value": "羊绒互传主模块"
+    },
+    {
+      "name": "ability_desc",
+      "value": "羊绒互传入口能力"
+    },
+    {
+      "name": "service_desc",
+      "value": "Nearby discovery and receive service"
+    },
+    {
+      "name": "permission_internet",
+      "value": "用于局域网本地传输。"
+    },
+    {
+      "name": "permission_network_info",
+      "value": "用于显示本地传输地址。"
+    },
+    {
+      "name": "permission_wifi",
+      "value": "用于创建 Wi-Fi 直连传输。"
+    },
+    {
+      "name": "permission_location",
+      "value": "系统要求的定位权限，用于附近设备发现。"
+    },
+    {
+      "name": "permission_bluetooth",
+      "value": "用于发现附近兼容设备。"
+    },
+    {
+      "name": "permission_background",
+      "value": "让接收服务在后台持续运行。"
+    },
+    {
+      "name": "permission_bundle",
+      "value": "用于标识本应用。"
+    },
+    {
+      "name": "permission_keep_background_running",
+      "value": "用于通过长时任务在后台持续接收文件。"
+    },
+    {
+      "name": "gallery_auto_save_title",
+      "value": "照片/视频保存至图库"
+    },
+    {
+      "name": "gallery_auto_save_dialog_title",
+      "value": "保存到图库"
+    },
+    {
+      "name": "gallery_auto_save_dialog_body",
+      "value": "收到的照片或视频需要你授权才能保存到图库，取消则按原方式保存。"
+    },
+    {
+      "name": "gallery_auto_save_dialog_cancel",
+      "value": "按原方式保存"
+    },
+    {
+      "name": "quick_share_receive_done_one",
+      "value": "已接收 1 个文件：%s。"
+    },
+    {
+      "name": "quick_share_receive_done_many",
+      "value": "已接收 %d 个文件：%s。"
+    },
+    {
+      "name": "quick_share_receive_done_empty",
+      "value": "接收完成。"
+    },
+    {
+      "name": "brand_name_xiaomi",
+      "value": "Xiaomi"
+    },
+    {
+      "name": "brand_name_oppo",
+      "value": "OPPO"
+    },
+    {
+      "name": "brand_name_vivo",
+      "value": "vivo"
+    },
+    {
+      "name": "brand_name_honor",
+      "value": "Honor"
+    },
+    {
+      "name": "brand_name_oneplus",
+      "value": "OnePlus"
+    },
+    {
+      "name": "brand_name_realme",
+      "value": "realme"
+    },
+    {
+      "name": "brand_name_samsung",
+      "value": "Samsung"
+    },
+    {
+      "name": "brand_name_meizu",
+      "value": "Meizu"
+    },
+    {
+      "name": "brand_name_third_party",
+      "value": "Third-party"
+    },
+    {
+      "name": "mta_send_stage_idle",
+      "value": "Not started"
+    },
+    {
+      "name": "mta_send_stage_gatt_connecting",
+      "value": "Connecting to device"
+    },
+    {
+      "name": "mta_send_stage_waiting_peer_ready",
+      "value": "Waiting for the device to be ready"
+    },
+    {
+      "name": "mta_send_stage_group_creating",
+      "value": "Establishing connection"
+    },
+    {
+      "name": "mta_send_stage_server_starting",
+      "value": "Preparing transfer"
+    },
+    {
+      "name": "mta_send_stage_p2p_info_written",
+      "value": "Waiting for the peer to join"
+    },
+    {
+      "name": "mta_send_stage_waiting_ws",
+      "value": "Waiting for the peer to connect"
+    },
+    {
+      "name": "mta_send_stage_negotiated",
+      "value": "Negotiating"
+    },
+    {
+      "name": "mta_send_stage_waiting_peer_confirm",
+      "value": "Waiting for confirmation"
+    },
+    {
+      "name": "mta_send_stage_transferring",
+      "value": "Sending"
+    },
+    {
+      "name": "mta_send_stage_completed",
+      "value": "Sent"
+    },
+    {
+      "name": "mta_send_stage_partial",
+      "value": "Partially completed (only some files received)"
+    },
+    {
+      "name": "mta_send_stage_rejected",
+      "value": "Declined by peer"
+    },
+    {
+      "name": "mta_send_stage_failed",
+      "value": "Send failed"
+    },
+    {
+      "name": "mta_send_stage_cancel_notifying",
+      "value": "Notifying the peer of cancellation"
+    },
+    {
+      "name": "mta_send_stage_cancelled",
+      "value": "Cancelled"
+    },
+    {
+      "name": "mta_send_stage_unknown",
+      "value": "Unknown"
+    },
+    {
+      "name": "storage_insufficient_message",
+      "value": "Insufficient storage: %s available, %s required (including reserve)"
+    },
+    {
+      "name": "settings_verify_title",
+      "value": "传输前核对验证码"
+    },
+    {
+      "name": "settings_verify_description",
+      "value": "核对双方显示的验证码后再开始传输。"
+    },
+    {
+      "name": "settings_visible_description",
+      "value": "让附近的 LocalSend 设备发现本机。"
+    },
+    {
+      "name": "settings_transport_description",
+      "value": "自动选择连接方式，也可指定同一网络或设备直连。"
+    },
+    {
+      "name": "settings_bt_title",
+      "value": "Windows 接收蓝牙地址"
+    },
+    {
+      "name": "settings_bt_description",
+      "value": "接收 Windows 文件前，请填写手机设置中“关于本机”的蓝牙地址。"
+    },
+    {
+      "name": "settings_bt_missing",
+      "value": "请先填写本机蓝牙地址，Windows 才能连接发送。"
+    },
+    {
+      "name": "settings_wifi_title",
+      "value": "Windows 优先使用 Wi-Fi"
+    },
+    {
+      "name": "settings_wifi_description",
+      "value": "开启后优先通过 Wi-Fi 接收 Windows 文件，关闭后使用蓝牙。"
+    },
+    {
+      "name": "settings_pin_title",
+      "value": "接收密码（可选）"
+    },
+    {
+      "name": "settings_pin_description",
+      "value": "发送方输入此密码后才能发送文件，连续输错三次会被锁定。"
+    },
+    {
+      "name": "settings_encryption_title",
+      "value": "LocalSend 加密传输"
+    },
+    {
+      "name": "settings_encryption_description",
+      "value": "使用加密连接接收 LocalSend 文件。"
+    },
+    {
+      "name": "settings_background_title",
+      "value": "后台接收"
+    },
+    {
+      "name": "settings_background_description",
+      "value": "允许应用在后台继续接收文件，实际运行受系统限制。"
+    },
+    {
+      "name": "settings_dynamic_title",
+      "value": "动态照片传输"
+    },
+    {
+      "name": "settings_dynamic_description",
+      "value": "收发时转换动态照片格式，让支持的设备尽可能保留动态效果。"
+    },
+    {
+      "name": "settings_hdr_title",
+      "value": "HDR 照片兼容处理"
+    },
+    {
+      "name": "settings_hdr_description",
+      "value": "调整 HDR 照片格式以兼容不同设备，处理后大小可能变化。"
+    },
+    {
+      "name": "settings_exif_title",
+      "value": "保留拍摄信息"
+    },
+    {
+      "name": "settings_exif_description",
+      "value": "处理照片时保留拍摄时间、设备和位置，关闭后可能影响实况照片识别。"
+    },
+    {
+      "name": "settings_hdr_original_title",
+      "value": "转换时保留原始画质"
+    },
+    {
+      "name": "settings_hdr_original_description",
+      "value": "转换 HDR 照片时优先保留原图画质，兼容效果可能因设备而异。"
+    },
+    {
+      "name": "settings_dynamic_download_title",
+      "value": "动态照片不另存下载副本"
+    },
+    {
+      "name": "settings_dynamic_download_description",
+      "value": "动态照片已存入图库或等待保存时，不再另存到下载文件夹。"
+    },
+    {
+      "name": "settings_dynamic_format_title",
+      "value": "默认动态照片格式"
+    },
+    {
+      "name": "settings_dynamic_format_description",
+      "value": "无法识别对方设备时，使用所选格式发送动态照片。"
+    },
+    {
+      "name": "settings_logs_description",
+      "value": "将运行记录保存到下载文件夹，方便排查问题。"
+    },
+    {
+      "name": "gallery_auto_save_description",
+      "value": "收到照片或视频后保存到图库，需要时再提示授权。"
+    }
   ]
 }

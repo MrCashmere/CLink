@@ -35,12 +35,13 @@ interface DerLen {
  *   ClientInit(2) -> ServerInit(3) -> ClientFinish(4) -> Established
  *
  * - ECDH P-256, commitment = SHA512(full serialized Ukey2Message). This module
- *   is driven by an explicit state machine.
+ *   is driven by an explicit state machine. Evidence: docs/UKEY2.md and the
+ *   public NearDrop protocol definitions and reference implementation.
  * - After key exchange both peers derive the D2D + SecureMessage keys using the
  *   NearDrop HKDF chain (auth / next / client / server / ENC:2 / SIG:1).
  * - encrypt/decrypt wrap an already-serialized frame in a SecureMessage
  *   (AES-256-CBC + HMAC-SHA256). This repo's envelope does not yet emit the
- *   DeviceToDeviceMessage sequence wrapper.
+ *   DeviceToDeviceMessage sequence wrapper (see docs/UNVERIFIED.md).
  */
 export class UKEY2Handshake {
   private keyPair?: cryptoFramework.KeyPair;

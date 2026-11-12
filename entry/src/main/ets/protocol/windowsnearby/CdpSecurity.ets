@@ -10,13 +10,14 @@ import { LogCapture as Lg } from '../../common/LogCapture';
  * (raw r||s, 64 bytes) because Windows/.NET ECDsa uses that by default, while
  * HarmonyOS cryptoFramework emits DER; this module converts between the two.
  *
- * UNVERIFIED: the exact HarmonyOS cryptoFramework ECC
- * key import / raw-point conversion format. All calls isolate the uncertainty
- * here so the wire codec, Bond value set and cryptor remain independently valid.
+ * The key import and authentication flow require testing with a Windows peer.
  */
 
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
+import certManager from '@ohos.security.cert';
 import { common } from '@kit.AbilityKit';
+import fs from '@ohos.file.fs';
+import { nativeGenerateCdpIdentity } from 'libmta_core.so';
 import { ByteUtils } from '../../common/ByteUtils';
 import { CdpCryptor } from './CdpCryptor';
 
@@ -156,29 +157,91 @@ export function buildSpkiPoint(point: CdpPublicPoint): Uint8Array {
   return outer;
 }
 
+interface CdpIdentityData {
+  readonly certificateHex: string;
+  readonly privateKeyHex: string;
+  readonly publicKeyHex: string;
+}
+
 export class CdpSecurity {
+  private static readonly identities: Map<string, Promise<CdpSecurity>> = new Map();
   private readonly certDer: Uint8Array;
   private readonly keyDer: Uint8Array;
   private readonly point: CdpPublicPoint;
   private keyPair?: cryptoFramework.KeyPair;
-  private readonly context: common.Context;
-
-  private constructor(context: common.Context, certDer: Uint8Array, keyDer: Uint8Array, point: CdpPublicPoint) {
-    this.context = context;
+  private constructor(certDer: Uint8Array, keyDer: Uint8Array, point: CdpPublicPoint) {
     this.certDer = certDer;
     this.keyDer = keyDer;
     this.point = point;
   }
 
   static async load(context: common.Context): Promise<CdpSecurity> {
-    const certDer = await CdpSecurity.readRaw(context, 'windowsnearby/cdp_ec_cert.der');
-    const keyDer = await CdpSecurity.readRaw(context, 'windowsnearby/cdp_ec_key.der');
-    const pubDer = await CdpSecurity.readRaw(context, 'windowsnearby/cdp_ec_pub.der');
-    const point = parseSpkiPoint(pubDer);
-    if (point === undefined) {
-      throw new Error('CDP: could not parse bundled EC public key');
+    const directory = context.filesDir;
+    const pending = CdpSecurity.identities.get(directory);
+    if (pending !== undefined) { return await pending; }
+    const created = CdpSecurity.loadIdentity(directory);
+    CdpSecurity.identities.set(directory, created);
+    try {
+      return await created;
+    } catch (error) {
+      if (CdpSecurity.identities.get(directory) === created) { CdpSecurity.identities.delete(directory); }
+      throw error as Error;
     }
-    return new CdpSecurity(context, certDer, keyDer, point);
+  }
+
+  private static async loadIdentity(directory: string): Promise<CdpSecurity> {
+    const destination = directory + '/windows-nearby-identity-v1.json';
+    try {
+      if (fs.accessSync(destination) && fs.statSync(destination).size <= 8192) {
+        return await CdpSecurity.decodeIdentity(await fs.readText(destination));
+      }
+    } catch (_error) {
+      // Corrupt or incompatible local identity; replace it with a fresh pair.
+    }
+    const serialized: string = await nativeGenerateCdpIdentity();
+    const identity = await CdpSecurity.decodeIdentity(serialized);
+    const temporaryDir = fs.mkdtempSync(directory + '/cdp-identity-XXXXXX');
+    try {
+      const temporary = temporaryDir + '/identity.json';
+      const file = fs.openSync(temporary, fs.OpenMode.WRITE_ONLY | fs.OpenMode.CREATE);
+      try {
+        const bytes = ByteUtils.encodeText(serialized);
+        if (fs.writeSync(file.fd, ByteUtils.toArrayBuffer(bytes)) !== bytes.length) {
+          throw new Error('CDP: failed to persist the local identity');
+        }
+        fs.fsyncSync(file.fd);
+      } finally {
+        fs.closeSync(file);
+      }
+      fs.renameSync(temporary, destination);
+      return identity;
+    } finally {
+      try { fs.rmdirSync(temporaryDir); } catch (_error) {}
+    }
+  }
+
+  private static async decodeIdentity(serialized: string): Promise<CdpSecurity> {
+    const data = JSON.parse(serialized) as CdpIdentityData;
+    const cert = CdpSecurity.decodeDer(data.certificateHex);
+    const key = CdpSecurity.decodeDer(data.privateKeyHex);
+    const point = parseSpkiPoint(CdpSecurity.decodeDer(data.publicKeyHex));
+    const embedded = await CdpSecurity.pointFromCertificate(cert);
+    if (point === undefined || embedded === undefined ||
+      ByteUtils.toHex(embedded.x) !== ByteUtils.toHex(point.x) ||
+      ByteUtils.toHex(embedded.y) !== ByteUtils.toHex(point.y)) {
+      throw new Error('CDP: invalid local certificate');
+    }
+    const result = new CdpSecurity(cert, key, point);
+    await result.ensureKeyPair();
+    return result;
+  }
+
+  private static decodeDer(value: string): Uint8Array {
+    if (typeof value !== 'string' || value.length === 0 || value.length > 4096 ||
+      value.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(value)) {
+      throw new Error('CDP: malformed local identity');
+    }
+    return ByteUtils.fromHex(value);
   }
 
   get certificateDer(): Uint8Array {
@@ -187,11 +250,6 @@ export class CdpSecurity {
 
   get publicPoint(): CdpPublicPoint {
     return this.point;
-  }
-
-  private static async readRaw(context: common.Context, name: string): Promise<Uint8Array> {
-    const content = await context.resourceManager.getRawFileContent(name);
-    return new Uint8Array(content);
   }
 
   private async ensureKeyPair(): Promise<cryptoFramework.KeyPair> {
@@ -236,7 +294,7 @@ export class CdpSecurity {
 
   /** Verify a remote thumbprint using the remote certificate's embedded public key. */
   async verifyThumbprint(certDer: Uint8Array, signature: Uint8Array, hostNonce: Uint8Array, clientNonce: Uint8Array): Promise<boolean> {
-    const certPoint = CdpSecurity.pointFromCertificate(certDer);
+    const certPoint = await CdpSecurity.pointFromCertificate(certDer);
     Lg.i('羊绒互传 CdpSecurity: verifyThumbprint certPoint=' + (certPoint !== undefined) + ' sigLen=' + signature.length);
     if (certPoint === undefined) {
       return false;
@@ -268,23 +326,15 @@ export class CdpSecurity {
    * final BIT STRING (0x03 ... 0x00 0x04 X Y). If parsing fails we return undefined and
    * the caller degrades the verification to a best-effort check.
    */
-  private static pointFromCertificate(certDer: Uint8Array): CdpPublicPoint | undefined {
-    for (let i = certDer.length - 1; i >= 0; i--) {
-      // SubjectPublicKeyInfo ALGORITHM BIT STRING: 03 <len> 00 04 <X> <Y>.
-      // i+2 is the unused-bits byte (0x00), i+3 is the uncompressed marker (0x04).
-      if (certDer[i] === 0x03 && i + 3 < certDer.length && certDer[i + 2] === 0x00 && certDer[i + 3] === 0x04) {
-        const offset = i + 4;
-        if (offset + 64 <= certDer.length) {
-          const point: CdpPublicPoint = {
-            x: certDer.slice(offset, offset + 32),
-            y: certDer.slice(offset + 32, offset + 64)
-          };
-          return point;
-        }
-        return undefined;
-      }
+  private static async pointFromCertificate(der: Uint8Array): Promise<CdpPublicPoint | undefined> {
+    try {
+      const certificate = await certManager.createX509Cert({
+        data: der, encodingFormat: certManager.EncodingFormat.FORMAT_DER
+      });
+      return parseSpkiPoint(certificate.getPublicKey().getEncoded().data);
+    } catch (_error) {
+      return undefined;
     }
-    return undefined;
   }
 
   /** Read a DER INTEGER (0x02 <len> <value>) at an offset. */

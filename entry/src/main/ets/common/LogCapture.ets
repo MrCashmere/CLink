@@ -28,9 +28,17 @@ export class LogCapture {
       return;
     }
     try {
-      LogCapture.logDir = context.filesDir + '/' + LOG_DIR_NAME;
-      fs.mkdirSync(LogCapture.logDir);
-      LogCapture.logFile = LogCapture.logDir + '/' + LOG_FILE_NAME;
+      const dir = context.filesDir + '/' + LOG_DIR_NAME;
+      // 目录已存在时 mkdirSync 会抛 EEXIST(ret -17)；早期实现把它当成失败，
+      // catch 里清空 logFile，导致「第二次启动之后应用日志文件再也不写」。
+      if (!fs.accessSync(dir)) {
+        fs.mkdirSync(dir);
+      }
+      if (!fs.accessSync(dir)) {
+        return; // 目录确实建不出来：降级为仅 hilog。
+      }
+      LogCapture.logDir = dir;
+      LogCapture.logFile = dir + '/' + LOG_FILE_NAME;
     } catch (e) {
       // 沙箱目录缺失/只读时降级为仅 hilog，不阻塞应用。
       LogCapture.logDir = '';
@@ -45,6 +53,14 @@ export class LogCapture {
 
   /** 当前日志落盘路径（未初始化时为空字符串）。 */
   static currentPath(): string { return LogCapture.logFile; }
+
+  /**
+   * 立刻把缓冲里的日志落盘。
+   *
+   * 平时是攒够 16KB 才写一次文件（省 CPU），但排查动态图片这类「一次性动作」时，
+   * 缓冲里的关键几行可能几分钟都落不下去，导出日志会看不到刚发生的事。
+   */
+  static flushNow(): void { LogCapture.flush(); }
 
   /** 清空当前日志与待写缓冲。 */
   static clear(): void {

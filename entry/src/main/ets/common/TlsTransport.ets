@@ -24,19 +24,24 @@ class TlsClientTransport implements ByteTransport {
 
   static async connect(host: string, port: number): Promise<TlsClientTransport> {
     const tls = socket.constructTLSSocketInstance();
-    await tls.bind({ address: '0.0.0.0', family: 1, port: 0 });
-    const transport = new TlsClientTransport(tls);
-    tls.on('message', (info: socket.SocketMessageInfo) => {
-      if (transport.listener !== undefined) {
-        transport.listener(new Uint8Array(info.message));
-      }
-    });
-    await tls.connect({
-      address: { address: host, family: 1, port: port },
-      secureOptions: { protocols: [socket.Protocol.TLSv12, socket.Protocol.TLSv13] },
-      skipRemoteValidation: true
-    });
-    return transport;
+    try {
+      await tls.bind({ address: '0.0.0.0', family: 1, port: 0 });
+      const transport = new TlsClientTransport(tls);
+      tls.on('message', (info: socket.SocketMessageInfo) => {
+        if (transport.listener !== undefined) {
+          transport.listener(new Uint8Array(info.message));
+        }
+      });
+      await tls.connect({
+        address: { address: host, family: 1, port: port },
+        secureOptions: { protocols: [socket.Protocol.TLSv12, socket.Protocol.TLSv13] },
+        skipRemoteValidation: true
+      });
+      return transport;
+    } catch (error) {
+      await tls.close().catch((): void => undefined);
+      throw error instanceof Error ? error : new Error(JSON.stringify(error));
+    }
   }
 
   async send(data: Uint8Array): Promise<void> {
@@ -68,18 +73,23 @@ class TcpClientTransport implements ByteTransport {
 
   static async connect(host: string, port: number): Promise<TcpClientTransport> {
     const tcp = socket.constructTCPSocketInstance();
-    await tcp.bind({ address: '0.0.0.0', family: 1, port: 0 });
-    const transport = new TcpClientTransport(tcp);
-    tcp.on('message', (info: socket.SocketMessageInfo) => {
-      if (transport.listener !== undefined) {
-        transport.listener(new Uint8Array(info.message));
-      }
-    });
-    await tcp.connect({
-      address: { address: host, family: 1, port: port },
-      timeout: CONNECT_TIMEOUT_MS
-    });
-    return transport;
+    try {
+      await tcp.bind({ address: '0.0.0.0', family: 1, port: 0 });
+      const transport = new TcpClientTransport(tcp);
+      tcp.on('message', (info: socket.SocketMessageInfo) => {
+        if (transport.listener !== undefined) {
+          transport.listener(new Uint8Array(info.message));
+        }
+      });
+      await tcp.connect({
+        address: { address: host, family: 1, port: port },
+        timeout: CONNECT_TIMEOUT_MS
+      });
+      return transport;
+    } catch (error) {
+      await tcp.close().catch((): void => undefined);
+      throw error instanceof Error ? error : new Error(JSON.stringify(error));
+    }
   }
 
   async send(data: Uint8Array): Promise<void> {
@@ -100,11 +110,28 @@ class TcpClientTransport implements ByteTransport {
   }
 }
 
+/** A busy native socket retains at most one MiB; producers wait for space. */
+export async function sendNativeTls(handle: number, data: Uint8Array, isOpen: () => boolean): Promise<void> {
+  const chunkSize = 256 * 1024;
+  for (let offset = 0; offset < data.length; offset += chunkSize) {
+    const buffer = ByteUtils.toArrayBuffer(data.subarray(offset, offset + chunkSize));
+    const deadline = Date.now() + 120000;
+    while (true) {
+      if (handle <= 0 || !isOpen()) { throw new Error('TLS connection closed'); }
+      const status = tlsNative.send(handle, buffer) as number;
+      if (status > 0) { break; }
+      if (status < 0) { throw new Error('TLS send failed'); }
+      if (Date.now() >= deadline) { throw new Error('TLS send timed out'); }
+      await new Promise<void>((resolve: () => void): void => { setTimeout(resolve, 10); });
+    }
+  }
+}
+
 // Native mbedTLS transport (via libtls_transport.so). The native module creates the TCP
 // socket itself (POSIX connect), then runs the mbedTLS handshake/read/write on a worker
 // thread and delivers data/close through a threadsafe callback. There is no
 // @ohos.net.socket in the TLS data path: its event loop would otherwise compete with
-// mbedTLS over the same fd and stall the handshake.
+// mbedTLS over the same fd and stall the handshake (see docs/LOCALSEND_TLS.md).
 class NativeTlsTransport implements ByteTransport {
   private handle: number = 0;
   private listener?: TransportListener;
@@ -118,13 +145,12 @@ class NativeTlsTransport implements ByteTransport {
   static async connect(host: string, port: number, certPem?: string, keyPem?: string): Promise<NativeTlsTransport> {
     const transport = new NativeTlsTransport();
     // Native connect() does the TCP connect + mbedTLS handshake on a worker thread
-    // and returns immediately with a handle. LocalSend uses mutual TLS: the client must
-    // also present its own self-signed cert (the peer sends certificate_required if it
-    // is missing), so we forward the app's cert/key as a client certificate.
+    // without blocking the JS thread. Forward the per-device client certificate
+    // for peers that request one during the TLS handshake.
     Lg.i('羊绒互传 TLS: NativeTlsTransport.connect -> ' + host + ':' + port);
-    const rawHandle = tlsNative.connect(host, port,
+    const rawHandle = await (tlsNative.connect(host, port,
       { host: host, skipVerify: true, certPem: certPem ?? '', keyPem: keyPem ?? '' },
-      (chunk: ArrayBuffer | null, err: string | null): void => transport.routeNativeEvent(chunk, err)) as number | null | undefined;
+      (chunk: ArrayBuffer | null, err: string | null): void => transport.routeNativeEvent(chunk, err)) as Promise<number>);
     Lg.i('羊绒互传 TLS: native connect handle=' + rawHandle);
     if (rawHandle !== undefined && rawHandle !== null && rawHandle > 0) {
       transport.handle = rawHandle;
@@ -157,13 +183,7 @@ class NativeTlsTransport implements ByteTransport {
   }
 
   async send(data: Uint8Array): Promise<void> {
-    if (this.handle <= 0 || this.closed) {
-      throw new Error('native TLS transport closed');
-    }
-    const written = tlsNative.send(this.handle, ByteUtils.toArrayBuffer(data)) as number;
-    if (written < 0) {
-      throw new Error('native TLS send failed');
-    }
+    await sendNativeTls(this.handle, data, (): boolean => !this.closed);
   }
 
   onData(listener: TransportListener): void {

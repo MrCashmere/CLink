@@ -24,6 +24,20 @@ export class NearbyBleMedium {
   private readonly socketServer: NearbyBleSocketServer = new NearbyBleSocketServer();
   private onConnectionCb?: (conn: GsStreamConnection) => void;
   private started: boolean = false;
+  private watching: boolean = false;
+  private generation: number = 0;
+  private startOperation?: Promise<boolean>;
+  private endpointId: string = '';
+  private deviceName: string = '';
+  private readonly stateListener: (state: access.BluetoothState) => void = (state: access.BluetoothState): void => {
+    if (state === access.BluetoothState.STATE_ON && this.watching) {
+      this.start(this.endpointId, this.deviceName).catch((error: Error): void => {
+        Lg.w('[QUICKSHARE] BLE retry failed: ' + error.message);
+      });
+    } else if (state === access.BluetoothState.STATE_OFF) {
+      this.stopRuntime();
+    }
+  };
 
   setOnConnection(cb: (conn: GsStreamConnection) => void): void {
     this.onConnectionCb = cb;
@@ -33,23 +47,51 @@ export class NearbyBleMedium {
     this.socketServer.onSessionStart = cb;
   }
 
-  async start(endpointId: string, deviceName: string): Promise<void> {
-    if (this.started) {
-      return;
+  async start(endpointId: string, deviceName: string): Promise<boolean> {
+    this.endpointId = endpointId;
+    this.deviceName = deviceName;
+    if (!this.watching) {
+      try {
+        access.on('stateChange', this.stateListener);
+        this.watching = true;
+      } catch (error) {
+        Lg.w('[QUICKSHARE] BLE state subscription failed: ' + JSON.stringify(error));
+      }
     }
+    const generation: number = this.generation;
+    if (this.startOperation !== undefined) {
+      await this.startOperation;
+    }
+    if (generation !== this.generation) { return false; }
+    if (this.started) {
+      return true;
+    }
+    const operation: Promise<boolean> = this.startRuntime(endpointId, deviceName, generation);
+    this.startOperation = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.startOperation === operation) {
+        this.startOperation = undefined;
+      }
+    }
+  }
+
+  private async startRuntime(endpointId: string, deviceName: string, generation: number): Promise<boolean> {
     try {
       if (access.getState() !== access.BluetoothState.STATE_ON) {
         Lg.w('[QUICKSHARE] Nearby BLE medium skipped (bluetooth off)');
-        return;
+        return false;
       }
     } catch (error) {
       Lg.w('[QUICKSHARE] Nearby BLE medium skipped (bluetooth unavailable): ' + JSON.stringify(error));
-      return;
+      return false;
     }
     this.started = true;
 
     try {
       const gattAdvertisement: Uint8Array = await NearbyBleCodec.buildGattAdvertisement(endpointId, deviceName);
+      if (generation !== this.generation) { return false; }
       await this.socketServer.start({
         gattAdvertisement: gattAdvertisement,
         advertisementCharacteristicUuid: NearbyBleCodec.advertisementUuidString(0),
@@ -60,6 +102,10 @@ export class NearbyBleMedium {
         }
       });
 
+      if (generation !== this.generation) {
+        this.socketServer.stop();
+        return false;
+      }
       // Fast-init beacon signature for the legacy two-part advertisement.
       const beacon: Uint8Array = new Uint8Array(5);
       beacon.set(FAST_INIT_SIGNATURE, 0);
@@ -84,21 +130,38 @@ export class NearbyBleMedium {
       // API 24: AdvertiseSetting has no `isExtended` field (that is @since 26), so
       // extended advertising cannot be requested. Advertise the legacy two-part
       // (header + GATT slot) form, which is what API 24 supports.
+      if (generation !== this.generation) { return false; }
       ble.startAdvertising({ interval: 160, txPower: -6, connectable: true }, legacyAdv, legacyScanRt);
       Lg.i('[QUICKSHARE] Nearby BLE medium advertised legacy (API 24)');
+      return true;
     } catch (error) {
       this.started = false;
+      this.socketServer.stop();
       Lg.w('[QUICKSHARE] Nearby BLE medium start failed: ' + JSON.stringify(error));
+      return false;
     }
   }
 
   stop(): void {
-    if (!this.started) {
-      return;
+    if (this.watching) {
+      try {
+        access.off('stateChange', this.stateListener);
+      } catch (error) {
+        Lg.w('[QUICKSHARE] BLE state unsubscribe failed: ' + JSON.stringify(error));
+      }
+      this.watching = false;
     }
+    this.stopRuntime();
+  }
+
+  private stopRuntime(): void {
+    this.generation += 1;
+    const wasStarted: boolean = this.started;
     this.started = false;
     try {
-      ble.stopAdvertising();
+      if (wasStarted) {
+        ble.stopAdvertising();
+      }
     } catch (error) {
       Lg.w('[QUICKSHARE] Nearby BLE medium stopAdvertising failed: ' + JSON.stringify(error));
     }

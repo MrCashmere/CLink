@@ -1,13 +1,7 @@
-import {
-  HwRadius,
-  HwSpace,
-  hwTextPrimary,
-  hwTextSecondary,
-  hwPrimary,
-  hwGlassSurface,
-  hwGlassBorder
-} from '../utils/DesignTokens';
-import { isApi26OrAbove, immersiveMaterialModifier, legacyMaterialModifier } from '../utils/SystemMaterial';
+import { HwRadius, HwSpace, hwTextPrimary, hwTextSecondary, hwPrimary, hwGlassBorder, reloadAppTheme, HwColor, resolvePrimaryColor } from '../utils/DesignTokens';
+import { cardGlassEffect, cardGlassBorderColor, cardGlassShadow } from '../utils/SystemMaterial';
+import { CardSurface } from './CardSurface';
+import { AccentColorSentinel } from '../components/MaterialCard';
 
 export interface SolutionQA {
   qLabel: string;
@@ -74,6 +68,10 @@ export const SOLUTION_GROUPS: SolutionGroup[] = [
  */
 @Component
 export struct SolutionPanel {
+  /** 主题色变化时触发重建，让 HwColor.primary 与选中态取到新色值 */
+  @StorageProp('accentColor') @Watch('onAccentColorChanged') accentColor: string = '';
+  /** 页面底色（由 applyAppTheme 发布）。直接读 HwColor.background 登记不上依赖 */
+  @StorageProp('pageBackground') pageBackground: string = '';
   @StorageProp('isDarkMode') isDarkMode: boolean = false;
   @StorageLink('fontMode') fontMode: string = 'system';
   @StorageLink('fontFamilyEn') fontFamilyEn: string = 'system';
@@ -81,6 +79,10 @@ export struct SolutionPanel {
   @StorageLink('fontWeightMode') fontWeightMode: string = 'system';
   @StorageLink('fontWeightValue') fontWeightValue: number = 400;
   @StorageLink('immersiveLightEnabled') immersiveLightEnabled: boolean = true;
+  @StorageLink('beautifulCards') beautifulCards: boolean = false;
+  @StorageLink('classicCards') classicCards: boolean = false;
+  @StorageLink('cardShadowBorder') cardShadowBorder: boolean = true;
+  @StorageLink('experimentalCards') experimentalCards: boolean = false;
   /** 展开的解决方案卡片索引，-1 表示无展开。 */
   @State expandedSolution: number = -1;
 
@@ -113,7 +115,7 @@ export struct SolutionPanel {
         .fontFamily(this.appFontFamily(label))
         .fontWeight(FontWeight.Medium)
         .fontSize(13)
-        .fontColor(isQuestion ? hwPrimary(this.isDarkMode) : hwTextSecondary(this.isDarkMode))
+        .fontColor(isQuestion ? resolvePrimaryColor(this.isDarkMode, this.accentOrPrimary()) : hwTextSecondary(this.isDarkMode))
         .width(44)
       Column({ space: 2 }) {
         ForEach(content.split('\n'), (line: string) => {
@@ -124,7 +126,7 @@ export struct SolutionPanel {
             .fontColor(isQuestion ? hwTextPrimary(this.isDarkMode) : hwTextSecondary(this.isDarkMode))
             .lineHeight(20)
             .width('100%')
-        }, (line: string, index: number) => label + ':' + line + ':' + index)
+        }, (line: string, index: number) => label + ':' + line + ':' + index + ':' + this.accentColor)
       }
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
@@ -135,47 +137,62 @@ export struct SolutionPanel {
 
   @Builder
   solutionCard(index: number, group: SolutionGroup) {
-    Column({ space: 10 }) {
-      Row({ space: 8 }) {
-        Text(group.title)
-          .fontFamily(this.appFontFamily(group.title))
-          .fontWeight(this.appFontWeight())
-          .fontSize(15)
-          .fontColor(hwTextPrimary(this.isDarkMode))
-          .layoutWeight(1)
-        SymbolGlyph(this.expandedSolution === index ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
-          .fontSize(14)
-          .fontColor([hwTextSecondary(this.isDarkMode)])
-      }
-      .width('100%')
-
-      if (this.expandedSolution === index) {
-        Column({ space: 10 }) {
-          ForEach(group.items, (item: SolutionQA) => {
-            Column({ space: 6 }) {
-              this.qaRow(item.qLabel, item.question, true)
-              this.qaRow(item.aLabel, item.answer, false)
-            }
-            .width('100%')
-          }, (item: SolutionQA) => item.qLabel + ':' + item.aLabel)
+    CardSurface({ radius: HwRadius.card }) {
+      Column({ space: 10 }) {
+        Row({ space: 8 }) {
+          Text(group.title)
+            .fontFamily(this.appFontFamily(group.title))
+            .fontWeight(this.appFontWeight())
+            .fontSize(15)
+            .fontColor(hwTextPrimary(this.isDarkMode))
+            .layoutWeight(1)
+          SymbolGlyph(this.expandedSolution === index ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
+            .fontSize(14)
+            .fontColor([hwTextSecondary(this.isDarkMode)])
         }
         .width('100%')
+
+        if (this.expandedSolution === index) {
+          Column({ space: 10 }) {
+            ForEach(group.items, (item: SolutionQA) => {
+              Column({ space: 6 }) {
+                this.qaRow(item.qLabel, item.question, true)
+                this.qaRow(item.aLabel, item.answer, false)
+              }
+              .width('100%')
+            }, (item: SolutionQA) => item.qLabel + ':' + item.aLabel + ':' + this.accentColor)
+          }
+          .width('100%')
+        }
       }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
+      .onClick(() => {
+        this.expandedSolution = this.expandedSolution === index ? -1 : index;
+      })
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
-    .onClick(() => {
-      this.expandedSolution = this.expandedSolution === index ? -1 : index;
-    })
+  }
+
+  /** 主题色变了：HwColor 是模块级对象，改属性不会触发刷新，靠这里重建页面 */
+  onAccentColorChanged(): void {
+    reloadAppTheme();
+  }
+
+  /** 当前主题色。读 accentColor 建立依赖；直接写 HwColor.primary 切色后不会重新求值 */
+  private accentOrPrimary(): string {
+    return this.accentColor.length > 0 ? this.accentColor : HwColor.primary;
   }
 
   build() {
     Column({ space: 12 }) {
+      // 主题色依赖：切色时让本面板重新求值（零尺寸，不参与布局）
+      AccentColorSentinel()
       Text('解决方案')
         .fontFamily(this.appFontFamily('解决方案'))
         .fontWeight(this.appFontWeight())
@@ -186,7 +203,7 @@ export struct SolutionPanel {
 
       ForEach(SOLUTION_GROUPS, (group: SolutionGroup, index: number) => {
         this.solutionCard(index, group)
-      }, (group: SolutionGroup, index: number) => group.title + ':' + index)
+      }, (group: SolutionGroup, index: number) => group.title + ':' + index + ':' + this.accentColor)
     }
     .width('100%')
     .padding({ left: HwSpace.lg, right: HwSpace.lg, top: 16, bottom: 32 })

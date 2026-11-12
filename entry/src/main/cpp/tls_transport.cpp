@@ -34,6 +34,9 @@
 #include <mbedtls/pk.h>
 #include <psa/crypto.h>
 
+#include <algorithm>
+#include <chrono>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -56,6 +59,9 @@
 namespace {
 
 constexpr int CONNECT_TIMEOUT_MS = 8000;
+constexpr size_t MAX_QUEUED_WRITE_BYTES = 1024 * 1024;
+constexpr size_t WRITE_RECORD_BYTES = 16 * 1024;
+constexpr int CLOSE_DRAIN_TIMEOUT_MS = 4000;
 // An idle worker (handshake or read loop) must never block forever in poll(-1): a peer
 // that connects and then goes silent would pin a worker thread and leak the channel.
 constexpr int HANDSHAKE_TIMEOUT_MS = 15000;
@@ -193,9 +199,9 @@ struct Channel {
 
     std::thread worker;
     std::mutex mtx;
-    std::vector<unsigned char> writeQ;
-    bool closeReq = false;
-    bool running = true;
+    std::deque<std::vector<unsigned char>> writeQ;
+    size_t queuedWriteBytes = 0;
+    std::atomic<bool> closeReq{false};
 
     int wakeFd[2] = {-1, -1};   // [0] read, [1] write
 
@@ -285,6 +291,7 @@ void RemoveListener(int handle) {
 // call_js for a per-connection event: (chunk?:ArrayBuffer, err?:string). null chunk = closed.
 void TsfnCallBytes(napi_env env, napi_value js_cb, void * /*context*/, void *data) {
     std::unique_ptr<NativeEvent> ev(static_cast<NativeEvent *>(data));
+    if (env == nullptr || js_cb == nullptr) return;
     napi_value arg0, arg1;
     if (ev->kind == NativeEvent::CLOSED) {
         napi_get_null(env, &arg0);
@@ -309,6 +316,10 @@ void TsfnCallBytes(napi_env env, napi_value js_cb, void * /*context*/, void *dat
 // call_js for the listening socket: notifies ArkTS of an accepted raw fd + peer ip.
 void TsfnCallAccept(napi_env env, napi_value js_cb, void * /*context*/, void *data) {
     std::unique_ptr<AcceptEvent> ev(static_cast<AcceptEvent *>(data));
+    if (env == nullptr || js_cb == nullptr) {
+        ::close(ev->fd);
+        return;
+    }
     napi_value arg1, arg2;
     napi_create_int32(env, ev->fd, &arg1);
     napi_create_string_utf8(env, ev->peerIp.c_str(), NAPI_AUTO_LENGTH, &arg2);
@@ -336,9 +347,7 @@ void Emit(Channel *c, NativeEvent::Kind kind, const unsigned char *bytes, size_t
     if (msg != nullptr) {
         snprintf(ev->msg, sizeof(ev->msg), "%s", msg);
     }
-    if (c->tsfn != nullptr) {
-        napi_call_threadsafe_function(c->tsfn, ev, napi_tsfn_blocking);
-    } else {
+    if (c->tsfn == nullptr || napi_call_threadsafe_function(c->tsfn, ev, napi_tsfn_blocking) != napi_ok) {
         delete ev;
     }
 }
@@ -379,20 +388,6 @@ int WaitFor(Channel *c, int want, int timeoutMs = -1) {
 // record is written; we poll for the readiness with a bounded budget and then give up.
 static void BestEffortCloseNotify(Channel *c) {
     if (c->fd < 0) return;
-    // Drain any response bytes still queued so the close_notify alert never precedes the
-    // HTTP response (the ArkTS side enqueues then immediately calls close()). On a healthy
-    // connection this is a no-op because the worker flushed writeQ before teardown.
-    {
-        std::lock_guard<std::mutex> lk(c->mtx);
-        while (!c->writeQ.empty()) {
-            int wn = mbedtls_ssl_write(&c->ssl, c->writeQ.data(), c->writeQ.size());
-            if (wn > 0) {
-                c->writeQ.erase(c->writeQ.begin(), c->writeQ.begin() + wn);
-            } else {
-                break;   // WANT_* or error — stop; close_notify is best-effort from here
-            }
-        }
-    }
     int ret = mbedtls_ssl_close_notify(&c->ssl);
     for (int i = 0;
          i < 6 && (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
@@ -412,21 +407,25 @@ static const char *PeerAlertName(unsigned char code);  // defined below with the
 void WorkerMain(std::shared_ptr<Channel> c) {
     SetNonBlocking(c->fd);
 
-    int ret;
+    int ret = MBEDTLS_ERR_SSL_WANT_READ;
     bool handshakeTimedOut = false;
-    while (c->running) {
+    const auto handshakeDeadline = std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(HANDSHAKE_TIMEOUT_MS);
+    while (!c->closeReq.load()) {
         ret = mbedtls_ssl_handshake(&c->ssl);
         if (ret == 0) break;
         if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
-            int w = WaitFor(c.get(), ret, HANDSHAKE_TIMEOUT_MS);
-            if (w == 1) { if (c->closeReq) { c->running = false; break; } continue; }
+            auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                handshakeDeadline - std::chrono::steady_clock::now()).count();
+            int w = left > 0 ? WaitFor(c.get(), ret, static_cast<int>(left)) : -2;
+            if (w == 1) continue;
             if (w == -2) { handshakeTimedOut = true; TLS_LOGE("handshake timed out after %{public}dms", HANDSHAKE_TIMEOUT_MS); break; }
             if (w < 0) break;
             continue;
         }
         break;   // fatal handshake error
     }
-    if (ret != 0 || !c->running) {
+    if (ret != 0 || c->closeReq.load()) {
         const char *side = c->is_server ? "srv" : "cli";
         char errmsg[256] = {0};
         if (handshakeTimedOut) {
@@ -463,78 +462,81 @@ void WorkerMain(std::shared_ptr<Channel> c) {
 
     unsigned char buf[16384];
     char loopErr[256] = {0};
-    while (c->running) {
-        // 1) flush pending writes (non-blocking). mbedtls_ssl_write consumes at most one
-        //    TLS record (<= OUT_BUFFER_LEN) per call, so a large queued body is drained over
-        //    several iterations. If the socket's send buffer is full (peer backpressure /
-        //    the peer is still writing the received file to disk) it returns WANT_WRITE.
-        int want = MBEDTLS_ERR_SSL_WANT_READ;
-        bool blockedOnWrite = false;
-        {
+    std::vector<unsigned char> pending;
+    size_t offset = 0;
+    auto closeDeadline = std::chrono::steady_clock::time_point::max();
+    bool graceful = false;
+    while (true) {
+        const bool closing = c->closeReq.load();
+        if (closing && closeDeadline == std::chrono::steady_clock::time_point::max()) {
+            closeDeadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(CLOSE_DRAIN_TIMEOUT_MS);
+        }
+        if (std::chrono::steady_clock::now() >= closeDeadline) break;
+        if (pending.empty()) {
             std::lock_guard<std::mutex> lk(c->mtx);
-            while (!c->writeQ.empty()) {
-                int wn = mbedtls_ssl_write(&c->ssl, c->writeQ.data(), c->writeQ.size());
-                if (wn > 0) {
-                    c->writeQ.erase(c->writeQ.begin(), c->writeQ.begin() + wn);
-                } else if (wn == MBEDTLS_ERR_SSL_WANT_READ || wn == MBEDTLS_ERR_SSL_WANT_WRITE) {
-                    want = wn;                        // poll in this direction next
-                    blockedOnWrite = !c->writeQ.empty();
-                    break;
-                } else {
-                    c->running = false;               // fatal write error
-                    break;
-                }
+            if (!c->writeQ.empty()) {
+                pending = std::move(c->writeQ.front());
+                c->writeQ.pop_front();
+                offset = 0;
             }
         }
-        if (!c->running) break;
-
-        // 2) read (non-blocking) — but ONLY when the write queue is fully drained.
-        //    Reading while bytes are still queued to send would simply consume a record the
-        //    peer sent, and worse: the mbedtls_ssl_read below returns WANT_READ (nothing
-        //    inbound yet) and overwrites `want`, so the poll at step 3 waits for POLLIN.
-        //    During an upload the peer is on the other side waiting for the rest of the body
-        //    and never sends until it is complete, so POLLIN never fires → the worker stalls
-        //    and the body is never delivered → "transfer sticks at ~261KB". Keep the write
-        //    direction (POLLOUT) whenever there is still data to flush.
-        if (!blockedOnWrite) {
+        int want = MBEDTLS_ERR_SSL_WANT_READ;
+        if (!pending.empty()) {
+            // WANT_READ/WANT_WRITE must retry with the same pointer and length.
+            // Producers append to writeQ; only this worker owns pending.
+            size_t count = std::min(WRITE_RECORD_BYTES, pending.size() - offset);
+            int n = mbedtls_ssl_write(&c->ssl, pending.data() + offset, count);
+            if (n > 0) {
+                {
+                    std::lock_guard<std::mutex> lk(c->mtx);
+                    c->queuedWriteBytes -= static_cast<size_t>(n);
+                }
+                offset += static_cast<size_t>(n);
+                if (offset == pending.size()) pending.clear();
+                continue;
+            }
+            if (n != MBEDTLS_ERR_SSL_WANT_READ && n != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                mbedtls_strerror(n, loopErr, sizeof(loopErr));
+                break;
+            }
+            want = n;
+        } else if (closing) {
+            graceful = true;
+            break;
+        } else {
             int n = mbedtls_ssl_read(&c->ssl, buf, sizeof(buf));
             if (n > 0) {
                 Emit(c.get(), NativeEvent::DATA, buf, static_cast<size_t>(n));
-            } else if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) {
-                want = n;
-            } else if (n == 0 || n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || n < 0) {
-                if (n < 0) {
-                    mbedtls_strerror(n, loopErr, sizeof(loopErr));
-                    TLS_LOGE("%{public}s read failed n=%{public}d (%{public}s)",
-                             c->is_server ? "srv" : "cli", n, loopErr);
-                }
-                c->running = false;
+                // More plaintext can already be buffered inside mbedTLS.
+                continue;
             }
-        } else if (want != MBEDTLS_ERR_SSL_WANT_READ) {
-            // still queued + the last write wanted writability → poll POLLOUT explicitly.
-            want = MBEDTLS_ERR_SSL_WANT_WRITE;
+            if (n != MBEDTLS_ERR_SSL_WANT_READ && n != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                if (n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) graceful = true;
+                else if (n < 0) mbedtls_strerror(n, loopErr, sizeof(loopErr));
+                break;
+            }
+            want = n;
         }
 
-        // 3) if still running and can make no more progress right now, wait for readiness
-        if (c->running) {
-            int pollRet = WaitFor(c.get(), want, READ_IDLE_TIMEOUT_MS);
-            if (pollRet == 1) {
-                std::lock_guard<std::mutex> lk(c->mtx);
-                if (c->closeReq) {
-                    c->running = false;
-                }
-            } else if (pollRet < 0) {
-                c->running = false;   // -1 poll error, -2 idle timeout: peer went silent
-            }
+        int timeout = READ_IDLE_TIMEOUT_MS;
+        if (closing) {
+            auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                closeDeadline - std::chrono::steady_clock::now()).count();
+            if (left <= 0) break;
+            timeout = static_cast<int>(left);
+        }
+        int wait = WaitFor(c.get(), want, timeout);
+        if (wait < 0) {
+            snprintf(loopErr, sizeof(loopErr), "%s", wait == -2 ? "TLS I/O timeout" : "TLS poll failed");
+            break;
         }
     }
-
-    // Send a proper TLS close_notify so a rustls/reqwest peer sees a clean shutdown.
-    // This is the path exercised whenever the server finishes a request (settle /
-    // respondAndClose -> conn.close -> native close) and whenever the JS side closes a
-    // channel; without it the peer reports "peer closed connection without sending TLS
-    // close_notify" even when the transfer succeeded.
-    BestEffortCloseNotify(c.get());
+    {
+        std::lock_guard<std::mutex> lk(c->mtx);
+        c->closeReq = true;
+    }
+    if (graceful) BestEffortCloseNotify(c.get());
 
     Emit(c.get(), NativeEvent::CLOSED, nullptr, 0, (loopErr[0] != '\0') ? loopErr : nullptr);
     RemoveChannel(c->handle);
@@ -604,32 +606,6 @@ bool OptBool(napi_env env, napi_value obj, const char *key, bool def) {
     if (napi_get_value_bool(env, v, &b) != napi_ok) return def;
     return b;
 }
-
-// Bundled self-signed CA. mbedTLS 3.x TLS 1.3 *clients* require a ca_chain to be
-// configured even when authmode is VERIFY_NONE (otherwise it raises
-// MBEDTLS_ERR_SSL_CA_CHAIN_REQUIRED during the handshake). Under VERIFY_NONE the
-// chain is never validated, so this placeholder CA only satisfies that requirement.
-static const char kBundledCaPem[] =
-    R"CA(-----BEGIN CERTIFICATE-----
-MIIDITCCAgmgAwIBAgIUInJ6/wu5s7IDQwMPiiwg/P4IzTcwDQYJKoZIhvcNAQEL
-BQAwHzEdMBsGA1UEAwwUTG9jYWxTZW5kLUJ1bmRsZWQtQ0EwIBcNMjYwODI3MDUx
-MTQ2WhgPMjEyNjA4MDMwNTExNDZaMB8xHTAbBgNVBAMMFExvY2FsU2VuZC1CdW5k
-bGVkLUNBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzhd10MxA4P8k
-l5gyeXOWmFTlZifA+8ArcRBj30xILxUgY0XvMPx/J9QPRlx+siNFsVbnSxp20+aM
-rumRfZqlOxwFl2yTYmyjMBmVD7k92Jy/5UNCfAI/or+a9Kndo1wBuIZKDCyNuaBZ
-aEaaz9e/C/cN0SKOvD2ARmNNlpCU1rsKAP65AjWAxiwxlalvGHNMZhusL/sGZQL5
-EWLQc5o1ZWg0FGrZg4jRlhLYIMBZlu8Q3/oeir/5evDFEQrkCgQluqTpV8ZmQq+g
-MeEEcrVlpWZHrJ2GDv+myBufdnEBag2U+7r39L/2f7vEEq1i3Sz2YRdAxoXGBBpC
-7LfJiDRjKwIDAQABo1MwUTAdBgNVHQ4EFgQU4gjC54STot4wO083E3ntLIytKtMw
-HwYDVR0jBBgwFoAU4gjC54STot4wO083E3ntLIytKtMwDwYDVR0TAQH/BAUwAwEB
-/zANBgkqhkiG9w0BAQsFAAOCAQEAI/+Ts86XCsK7O5GSm4rQ8JzSTBmYQpZGKlyB
-QLAbBZYPK4pBHsI5pcztRyuvADAPEUjaOK56EOa2lUgE5XFXq5cZec6I92iDApc7
-u9Nw7iL0ORFQNUvtJ/LBu981paxbhyrcBNprxxD5c4YKjCwBhGJI7ziLjuh7myv4
-1kH4sfjW+Pii6Ie5+cnBEn/wq3ih3blZujHx/2c9Cjnt6l1Q6gP6JsH8LN4YHEWF
-ilAEUbKBPHxBOJIHNxeG50iwCvfD9XUx7jxeYb7g+c6hJ9DDe0tyKTMWWT/sUsNb
-Mp2ijMPJCGm4iAc9yNyDWIKiuXFvqjTSQnaju+WDpT+Wr9prUw==
------END CERTIFICATE-----
-)CA";
 
 // True if s is a dotted IPv4 literal. Such a value must NOT be sent as TLS SNI
 // (RFC 6066 forbids IP literals in server_name), and some peers abort a
@@ -727,25 +703,17 @@ std::shared_ptr<Channel> SetupChannel(int fd, bool is_server, napi_env env, napi
                                                            : MBEDTLS_SSL_VERIFY_NONE);
         // Offer both TLS 1.2 and 1.3. The peer's HTTPS server rejected a TLS-1.2-only
         // ClientHello with a fatal alert (it wants TLS 1.3), so we must NOT cap to 1.2.
-        mbedtls_ssl_conf_min_version(&c->conf, MBEDTLS_SSL_MAJOR_VERSION_3,
-                                     MBEDTLS_SSL_MINOR_VERSION_3);
-        mbedtls_ssl_conf_max_version(&c->conf, MBEDTLS_SSL_MAJOR_VERSION_3,
-                                     MBEDTLS_SSL_MINOR_VERSION_3);
-        // mbedTLS 3.x's TLS 1.3 client path needs a ca_chain entry even under
-        // VERIFY_NONE; under VERIFY_NONE it is never validated. Prefer a caller-pinned
-        // serverCA when supplied, otherwise use the bundled self-signed CA placeholder.
+        mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_2);
+        mbedtls_ssl_conf_max_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
+        // Load caller-supplied trust roots only. Unverified LocalSend peers do
+        // not need a common certificate embedded in the application.
         if (!caPem.empty()) {
             if (mbedtls_x509_crt_parse(&c->ca, (const unsigned char *)caPem.c_str(),
-                                       caPem.size() + 1) < 0) {
+                                      caPem.size() + 1) < 0) {
                 outErr = "ca parse"; return nullptr;
             }
-        } else {
-            if (mbedtls_x509_crt_parse(&c->ca, (const unsigned char *)kBundledCaPem,
-                                       sizeof(kBundledCaPem)) < 0) {
-                outErr = "bundled ca parse"; return nullptr;
-            }
+            mbedtls_ssl_conf_ca_chain(&c->conf, &c->ca, nullptr);
         }
-        mbedtls_ssl_conf_ca_chain(&c->conf, &c->ca, nullptr);
         // LocalSend speaks HTTP/1.1 over TLS; advertise ALPN so the peer offers a
         // selected protocol instead of rejecting an unnegotiated handshake.
         static const char *kAlpn[] = {"http/1.1", nullptr};
@@ -785,8 +753,11 @@ std::shared_ptr<Channel> SetupChannel(int fd, bool is_server, napi_env env, napi
 
     napi_value asyncName;
     napi_create_string_utf8(env, "tls_transport", NAPI_AUTO_LENGTH, &asyncName);
-    napi_create_threadsafe_function(env, onEvent, nullptr, asyncName, 0, 1,
-                                    nullptr, nullptr, nullptr, TsfnCallBytes, &c->tsfn);
+    if (napi_create_threadsafe_function(env, onEvent, nullptr, asyncName, 64, 1,
+                                        nullptr, nullptr, nullptr, TsfnCallBytes, &c->tsfn) != napi_ok) {
+        outErr = "event callback setup failed";
+        return nullptr;
+    }
 
     AddChannel(c);   // sets c->handle; the caller reads c->handle after SetupChannel returns
 
@@ -796,48 +767,94 @@ std::shared_ptr<Channel> SetupChannel(int fd, bool is_server, napi_env env, napi
     return c;
 }
 
-// Client: native connect(host, port) -> mbedTLS client handshake. Returns a channel handle.
+// TCP/DNS dialing must not block the ArkTS thread. SetupChannel transfers the fd to
+// the connection worker, where the TLS handshake and all socket I/O take place.
+struct ConnectWork {
+    std::string host;
+    int port = 0;
+    int fd = -1;
+    napi_ref opts = nullptr;
+    napi_ref callback = nullptr;
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    ~ConnectWork() { if (fd >= 0) ::close(fd); }
+};
+
+static void ReleaseConnectWork(napi_env env, ConnectWork *job) {
+    if (job->opts != nullptr) napi_delete_reference(env, job->opts);
+    if (job->callback != nullptr) napi_delete_reference(env, job->callback);
+    if (job->work != nullptr) napi_delete_async_work(env, job->work);
+}
+
+static void RejectConnect(napi_env env, napi_deferred deferred, const std::string &reason) {
+    napi_value message, error;
+    napi_create_string_utf8(env, reason.c_str(), reason.size(), &message);
+    napi_create_error(env, nullptr, message, &error);
+    napi_reject_deferred(env, deferred, error);
+}
+
+static void ExecuteConnect(napi_env, void *data) {
+    auto *job = static_cast<ConnectWork *>(data);
+    job->fd = TcpConnect(job->host, job->port, CONNECT_TIMEOUT_MS);
+}
+
+static void CompleteConnect(napi_env env, napi_status status, void *data) {
+    std::unique_ptr<ConnectWork> job(static_cast<ConnectWork *>(data));
+    napi_value opts, onEvent;
+    std::shared_ptr<Channel> c;
+    std::string err = "TCP connect failed";
+    if (status == napi_ok && job->fd >= 0
+        && napi_get_reference_value(env, job->opts, &opts) == napi_ok
+        && napi_get_reference_value(env, job->callback, &onEvent) == napi_ok) {
+        int fd = job->fd;
+        job->fd = -1;
+        c = SetupChannel(fd, false, env, opts, onEvent, err);
+    }
+    if (c == nullptr) {
+        RejectConnect(env, job->deferred, err);
+    } else {
+        napi_value handle;
+        napi_create_int32(env, c->handle, &handle);
+        napi_resolve_deferred(env, job->deferred, handle);
+    }
+    ReleaseConnectWork(env, job.get());
+}
+
 napi_value Connect(napi_env env, napi_callback_info info) {
     size_t argc = 4;
     napi_value args[4];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-
-    std::string host;
-    {
-        size_t len = 0;
-        if (napi_get_value_string_utf8(env, args[0], nullptr, 0, &len) != napi_ok) {
-            Throw(env, "bad host"); return nullptr;
-        }
-        std::vector<char> buf(len + 1);
-        napi_get_value_string_utf8(env, args[0], buf.data(), buf.size(), &len);
-        host.assign(buf.data(), len);
-    }
+    size_t len = 0;
     int32_t port = 0;
-    napi_get_value_int32(env, args[1], &port);
-    napi_value opts = args[2];
-    napi_value onEvent = args[3];
-
-    if (host.empty() || port <= 0 || argc < 4) {
-        Throw(env, "bad args"); return nullptr;
+    napi_valuetype optType, cbType;
+    if (argc != 4 || napi_get_value_string_utf8(env, args[0], nullptr, 0, &len) != napi_ok ||
+        len == 0 || len > 255 || napi_get_value_int32(env, args[1], &port) != napi_ok ||
+        port <= 0 || port > 65535 || napi_typeof(env, args[2], &optType) != napi_ok || optType != napi_object ||
+        napi_typeof(env, args[3], &cbType) != napi_ok || cbType != napi_function) {
+        Throw(env, "bad TLS connect args");
+        return nullptr;
     }
-
-    int fd = TcpConnect(host, port, CONNECT_TIMEOUT_MS);
-    if (fd < 0) {
-        TLS_LOGE("client TCP connect %{public}s:%{public}d failed", host.c_str(), port);
-        Throw(env, "tcp connect failed"); return nullptr;
+    auto job = std::make_unique<ConnectWork>();
+    std::vector<char> buf(len + 1);
+    napi_get_value_string_utf8(env, args[0], buf.data(), buf.size(), &len);
+    job->host.assign(buf.data(), len);
+    job->port = port;
+    napi_value promise, resource;
+    if (napi_create_promise(env, &job->deferred, &promise) != napi_ok) {
+        Throw(env, "TLS promise setup failed");
+        return nullptr;
     }
-    TLS_LOGI("client TCP connect %{public}s:%{public}d -> fd=%{public}d", host.c_str(), port, fd);
-
-    std::string err;
-    std::shared_ptr<Channel> c = SetupChannel(fd, false, env, opts, onEvent, err);
-    if (c == nullptr) {
-        TLS_LOGE("client setup failed: %{public}s", err.c_str());
-        // ~Channel() already closed fd on the error path; do not close it again.
-        Throw(env, err.c_str()); return nullptr;
+    napi_create_string_utf8(env, "tls_connect", NAPI_AUTO_LENGTH, &resource);
+    if (napi_create_reference(env, args[2], 1, &job->opts) != napi_ok ||
+        napi_create_reference(env, args[3], 1, &job->callback) != napi_ok ||
+        napi_create_async_work(env, nullptr, resource, ExecuteConnect, CompleteConnect, job.get(), &job->work) != napi_ok ||
+        napi_queue_async_work(env, job->work) != napi_ok) {
+        RejectConnect(env, job->deferred, "could not start TLS connection");
+        ReleaseConnectWork(env, job.get());
+    } else {
+        job.release();
     }
-    napi_value handle;
-    napi_create_int32(env, c->handle, &handle);
-    return handle;
+    return promise;
 }
 
 // Server per-connection: mbedTLS server handshake on an accepted fd (from native listen).
@@ -936,24 +953,23 @@ napi_value Send(napi_env env, napi_callback_info info) {
     if (napi_get_arraybuffer_info(env, args[1], &buffer, &len) != napi_ok) {
         Throw(env, "bad buffer"); return nullptr;
     }
+    int32_t queued = 1;
     {
         std::lock_guard<std::mutex> lk(c->mtx);
-        // Do NOT reject a write when the worker loop has stopped (running==false): the
-        // LocalSend server enqueues the final `200 {"status":"ok"}` response and then
-        // immediately calls close(), and close() sets running=false. If we refuse to enqueue
-        // here the success response is dropped, the sender (rustls HTTP client) never sees a
-        // completion and retries the same file — which we observed as the same file being
-        // received several times. The worker's teardown drains writeQ (BestEffortCloseNotify)
-        // before closing the socket, so a response queued after the loop stopped is still
-        // flushed and close_notify is still sent. Only reject if the channel was already torn
-        // down (GetChannel above returned null).
-        const unsigned char *p = static_cast<const unsigned char *>(buffer);
-        c->writeQ.insert(c->writeQ.end(), p, p + len);
+        if (c->closeReq) {
+            queued = -1;
+        } else if (len > MAX_QUEUED_WRITE_BYTES - c->queuedWriteBytes) {
+            queued = 0;
+        } else if (len > 0) {
+            const auto *p = static_cast<const unsigned char *>(buffer);
+            c->writeQ.emplace_back(p, p + len);
+            c->queuedWriteBytes += len;
+        }
     }
-    WakeWorker(c.get());
-    napi_value one;
-    napi_create_int32(env, 1, &one);
-    return one;
+    if (queued > 0) WakeWorker(c.get());
+    napi_value result;
+    napi_create_int32(env, queued, &result);
+    return result;
 }
 
 napi_value Close(napi_env env, napi_callback_info info) {
@@ -967,7 +983,6 @@ napi_value Close(napi_env env, napi_callback_info info) {
         {
             std::lock_guard<std::mutex> lk(c->mtx);
             c->closeReq = true;
-            c->running = false;
         }
         WakeWorker(c.get());
     }

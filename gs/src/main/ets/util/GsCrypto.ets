@@ -37,9 +37,9 @@ export class GsCrypto {
   }
 
   /**
-   * HKDF-SHA256 (EXTRACT_AND_EXPAND). Used to mirror the Quick Share
-   * post-handshake "authString" derivation so the PIN seed follows the same
-   * salt semantics ("UKEY2 v1 auth").
+   * HKDF-SHA256 (EXTRACT_AND_EXPAND). Used to mirror the Quick Share (Bada /
+   * NearDrop) post-handshake "authString" derivation so the PIN seed follows
+   * the same salt semantics ("UKEY2 v1 auth").
    */
   static async hkdfSha256(key: Uint8Array, salt: Uint8Array, info: Uint8Array, lengthBytes: number): Promise<Uint8Array> {
     const kdf = cryptoFramework.createKdf('HKDF|SHA256');
@@ -55,8 +55,8 @@ export class GsCrypto {
   }
 
   /**
-   * Derives the 4-digit Quick Share confirmation PIN — bit-exact with the
-   * open-source reference implementation (ported from NearDrop
+   * Derives the 4-digit Quick Share confirmation PIN — bit-exact with Bada's
+   * `PinDerivation.deriveFourDigitPin` (ported from NearDrop
    * `pinCodeFromAuthKey` / Chromium):
    *
    *     hash = 0; multiplier = 1

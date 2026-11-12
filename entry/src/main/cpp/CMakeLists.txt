@@ -37,3 +37,15 @@ target_include_directories(mbedtls
 add_library(tls_transport SHARED tls_transport.cpp)
 # libhilog_ndk.z.so: OH_LOG_Print diagnostic logging for the native TLS handshake.
 target_link_libraries(tls_transport PUBLIC libace_napi.z.so libhilog_ndk.z.so mbedtls pthread)
+
+# --- LocalSend discovery over hotspot (SoftAP) interfaces ---
+# @ohos.net.socket always sends through the system default network, which is cellular while
+# the phone shares its own hotspot; there is also no NetHandle for the SoftAP network that a
+# third-party app could bind to. This module does the two things at POSIX level:
+# getifaddrs() to enumerate ap0/swlan0 and its address, and a UDP send that is pinned to that
+# address (bind + IP_MULTICAST_IF) so the multicast announce and directed broadcast actually
+# leave through the hotspot. See docs/HOTSPOT_SHARING.md §❸.
+add_library(net_discovery SHARED net_discovery.cpp)
+# pthread: the relay runs a std::thread that re-injects announcements arriving on
+# the hotspot into the loopback port where the ArkTS socket listens.
+target_link_libraries(net_discovery PUBLIC libace_napi.z.so libhilog_ndk.z.so pthread)

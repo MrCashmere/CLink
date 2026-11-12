@@ -6,6 +6,8 @@
     "pages/NearSharingReceive",
     "pages/LocalSend",
     "pages/QuickShare",
+    "pages/Mta",
+    "pages/MtaLicenses",
     "pages/LanWebTransfer",
     "pages/AppearanceSettingsPage",
     "pages/FontManagePage",

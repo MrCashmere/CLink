@@ -16,6 +16,7 @@ import {
   GsSessionFileMeta,
   GsStreamConnection,
   WifiDirectUpgradeCredentials,
+  GsTransportChange,
   GsTlsMaterial,
   GsTlsProvider,
   GsDeps,
@@ -38,13 +39,20 @@ export interface GsSendHooks {
   forceWifiDirect?: boolean;
   pcPeer?: boolean;
   onWifiDirectTransport?: (creds: WifiDirectUpgradeCredentials) => Promise<GsStreamConnection | undefined>;
+  /** 介质变化通知（升级成功/失败/留在原通道），用于日志与页面提示。 */
+  onTransportChange?: (change: GsTransportChange) => void;
 }
 
 export interface GsReceiveHooks {
   onIncomingSession: (key: string, peerName: string, files: SessionFileMeta[], pin: string) => Promise<boolean>;
-  onFileReceived: (file: IncomingFile) => void;
+  onFileReceived: (file: IncomingFile) => Promise<void>;
   onProgress: (percent: number) => void;
+  onSessionFailed?: (key: string, reason: string) => void;
   onUpgradeAvailable?: (mediums: number[]) => Promise<WifiDirectUpgradeCredentials | undefined>;
+  /** 局域网会话上是否也要求接收端**主动**发起 Wi-Fi Direct 升级（BLE 引导会话默认主动）。 */
+  proactiveWifiDirect?: boolean;
+  /** 介质变化通知（升级成功/失败/留在原通道），用于日志与页面提示。 */
+  onTransportChange?: (change: GsTransportChange) => void;
 }
 
 /** 命名类型（ArkTS 禁止在类型位置上使用内联对象字面量类型）。 */
@@ -100,6 +108,7 @@ export {
 
 export type { GsStreamConnection };
 export type { WifiDirectUpgradeCredentials };
+export type { GsTransportChange };
 
 function toGsDevice(device: DeviceEndpoint): GsDevice {
   return {
@@ -157,7 +166,8 @@ function buildProtoSendHooks(hooks: GsSendHooks): GsProtoSendHooks {
     sourceAddress: hooks.sourceAddress,
     forceWifiDirect: hooks.forceWifiDirect,
     pcPeer: hooks.pcPeer,
-    onWifiDirectTransport: hooks.onWifiDirectTransport
+    onWifiDirectTransport: hooks.onWifiDirectTransport,
+    onTransportChange: hooks.onTransportChange
   };
 }
 
@@ -172,12 +182,21 @@ function buildProtoReceiveHooks(hooks: GsReceiveHooks): GsProtoReceiveHooks {
       }));
       return hooks.onIncomingSession(key, peerName, meta, pin);
     },
-    onFileReceived: (file: GsIncomingFile): void => {
-      const incoming: IncomingFile = { name: file.name, size: file.size, savedPath: file.savedPath };
-      hooks.onFileReceived(incoming);
+    onFileReceived: async (file: GsIncomingFile): Promise<void> => {
+      const incoming: IncomingFile = {
+        name: file.name,
+        size: file.size,
+        savedPath: file.savedPath,
+        mime: file.mime,
+        stagedForSave: file.stagedForSave === true
+      };
+      await hooks.onFileReceived(incoming);
     },
+    onSessionFailed: hooks.onSessionFailed,
     onProgress: (percent: number): void => hooks.onProgress(percent),
-    onUpgradeAvailable: hooks.onUpgradeAvailable
+    onUpgradeAvailable: hooks.onUpgradeAvailable,
+    proactiveWifiDirect: hooks.proactiveWifiDirect,
+    onTransportChange: hooks.onTransportChange
   };
 }
 

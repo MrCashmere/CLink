@@ -8,6 +8,14 @@
     "deliveryWithInstall": true,
     "installationFree": false,
     "pages": "$profile:main_pages",
+    // 应用级沉浸式系统材质开关（API 26.0.0 起生效，仅 entry 模块有效）。
+    // enable 模式下 systemMaterial 的材质样式优先级高于组件自身的背景色、模糊、阴影与边框。
+    "metadata": [
+      {
+        "name": "ohos.arkui.UIMaterial.state",
+        "value": "enable"
+      }
+    ],
     "requestPermissions": [
       {
         "name": "ohos.permission.INTERNET",
@@ -79,6 +87,9 @@
               { "scheme": "file", "utd": "general.xml", "maxFileSupported": 100 },
               { "scheme": "file", "utd": "general.json", "maxFileSupported": 100 },
               { "scheme": "file", "utd": "general.pdf", "maxFileSupported": 100 },
+              { "scheme": "file", "utd": "com.adobe.pdf", "maxFileSupported": 100 },
+              { "scheme": "file", "utd": "openharmony.app", "maxFileSupported": 100 },
+              { "scheme": "file", "utd": "openharmony.hap", "maxFileSupported": 100 },
               { "scheme": "file", "utd": "general.image", "maxFileSupported": 100 },
               { "scheme": "file", "utd": "general.png", "maxFileSupported": 100 },
               { "scheme": "file", "utd": "general.jpeg", "maxFileSupported": 100 },

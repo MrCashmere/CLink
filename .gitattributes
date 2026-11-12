@@ -1,0 +1,6 @@
+# Preserve imported MTA snapshot bytes so provenance hashes remain reproducible.
+entry/src/main/ets/mta/upstream/** -text
+mta_native/** -text
+docs/upstream/handysend/** -text
+licenses/** -text
+entry/src/main/resources/rawfile/licenses/** -text

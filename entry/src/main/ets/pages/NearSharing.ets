@@ -8,20 +8,31 @@ import { DeviceEndpoint, IncomingFile, OutgoingFile } from '../model/TransferMod
 import { DeviceList } from '../view/DeviceList';
 import { IconCircleButton } from '../components/IconCircleButton';
 import { AppBackground } from '../components/AppBackground';
-import { HwColor, HwRadius, HwSpace, hwTextPrimary, hwTextSecondary, hwPrimary, hwPrimaryButton, hwGlassSurface, hwGlassBorder } from '../utils/DesignTokens';
-import { isApi26OrAbove, immersiveMaterialModifier, legacyMaterialModifier } from '../utils/SystemMaterial';
+import { HwColor, HwRadius, HwSpace, hwTextPrimary, hwTextSecondary, hwPrimary, hwPrimaryButton, hwGlassBorder, reloadAppTheme, resolvePageBackground, onAccentColor, topBarGlassColor, resolvePrimaryColor, resolvePrimaryButtonColor } from '../utils/DesignTokens';
+import { cardGlassEffect, toastSystemMaterial, dialogSystemMaterial, cardGlassBorderColor, cardGlassShadow } from '../utils/SystemMaterial';
 import { SettingsStore } from '../common/SettingsStore';
 import { sharedFilesFromParams } from '../common/ShareHandleUtil';
 import { FilePickerHelper } from '../common/FilePickerHelper';
+import { DynamicPhotoService } from '../common/DynamicPhotoService';
 import { NearbyScanHub } from '../common/NearbyScanHub';
 import { WindowsNearbyOutgoingFile } from '../windowsnearby/WindowsNearbySender';
+import { CardSurface } from '../components/CardSurface';
+import { AccentColorSentinel } from '../components/MaterialCard';
 
 @Entry
 @Component
 struct NearSharing {
+  /** 主题色变化时触发重建，让 HwColor.primary 与选中态取到新色值 */
+  @StorageProp('accentColor') @Watch('onAccentColorChanged') accentColor: string = '';
+  /** 页面底色（由 applyAppTheme 发布）。直接读 HwColor.background 登记不上依赖 */
+  @StorageProp('pageBackground') pageBackground: string = '';
   @StorageProp('statusBarHeight') statusBarHeight: number = 0;
   @StorageProp('isDarkMode') isDarkMode: boolean = false;
   @StorageLink('immersiveLightEnabled') immersiveLightEnabled: boolean = true;
+  @StorageLink('beautifulCards') beautifulCards: boolean = false;
+  @StorageLink('classicCards') classicCards: boolean = false;
+  @StorageLink('cardShadowBorder') cardShadowBorder: boolean = true;
+  @StorageLink('experimentalCards') experimentalCards: boolean = false;
   @StorageLink('fontMode') fontMode: string = 'system';
   @StorageLink('fontFamilyEn') fontFamilyEn: string = 'system';
   @StorageLink('fontFamilyZh') fontFamilyZh: string = 'system';
@@ -91,6 +102,7 @@ struct NearSharing {
         return;
       }
       promptAction.showDialog({
+        systemMaterial: dialogSystemMaterial(),
         title: 'Windows Nearby 接收需要蓝牙地址',
         message: 'Windows 是通过蓝牙（RFCOMM）向手机发送文件的，需要手机的真实蓝牙 MAC 地址才能建立连接。\n\n请到「设置 → 关于本机 → 状态信息 → 蓝牙地址」复制本机地址，粘贴到 设置 → Windows Nearby 蓝牙 MAC 地址 中。示例：AA:BB:CC:DD:EE:FF',
         buttons: [
@@ -113,8 +125,20 @@ struct NearSharing {
     this.hub?.removeOnWindowsReceiveChange(this.onReceiveChanged);
   }
 
+  /** 主题色变了：HwColor 是模块级对象，改属性不会触发刷新，靠这里重建页面 */
+  onAccentColorChanged(): void {
+    reloadAppTheme();
+  }
+
+  /** 当前主题色。读 accentColor 建立依赖；直接写 HwColor.primary 切色后不会重新求值 */
+  private accentOrPrimary(): string {
+    return this.accentColor.length > 0 ? this.accentColor : HwColor.primary;
+  }
+
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
+      // 主题色依赖：切色时让整页重新求值（零尺寸，不参与布局）
+      AccentColorSentinel()
       AppBackground()
       Column() {
         Scroll() {
@@ -154,90 +178,100 @@ struct NearSharing {
       .backgroundColor(Color.Transparent)
 
       Row() {
-        IconCircleButton({ symbol: $r('sys.symbol.chevron_left'), buttonSize: 40, iconSize: 20, onAction: (): void => router.back() })
+        IconCircleButton({ symbol: $r('sys.symbol.chevron_left'), glass: true, buttonSize: 40, iconSize: 20, onAction: (): void => router.back() })
         Text('Windows Nearby').fontSize(20).fontWeight(FontWeight.Bold).fontFamily(this.appFontFamily('Windows Nearby')).fontColor(hwTextPrimary(this.isDarkMode)).margin({ left: HwSpace.md })
         Blank()
       }
       .width('100%')
       .height(56 + this.statusBarHeight)
       .padding({ left: 16, right: 16, top: this.statusBarHeight })
-      .backgroundEffect({ radius: 12, color: '#66FFFFFF' })
+      .backgroundEffect({ radius: 12, color: topBarGlassColor(this.isDarkMode) })
     }
     .width('100%')
     .height('100%')
-    .backgroundColor(this.isDarkMode ? HwColor.backgroundDark : HwColor.background)
+    .backgroundColor(resolvePageBackground(this.isDarkMode, this.pageBackground))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
   @Builder
   receivedFilesCard() {
-    Column({ space: 6 }) {
-      Text('已接收 ' + this.receivedFiles.length + ' 个文件').fontSize(14).fontWeight(FontWeight.Medium).fontFamily(this.appFontFamily('已接收 个文件')).fontColor(hwTextPrimary(this.isDarkMode))
-      ForEach(this.receivedFiles, (file: IncomingFile): void => {
-        Column({ space: 4 }) {
-          Row({ space: 8 }) {
-            Text(file.name).layoutWeight(1).fontSize(13).fontFamily(this.appFontFamily(file.name)).fontWeight(this.appFontWeight()).fontColor(hwTextPrimary(this.isDarkMode))
-              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-            Text(this.fileSizeText(file.size)).fontSize(12).fontFamily(this.appFontFamily(this.fileSizeText(file.size))).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
-            Button('打开', { type: ButtonType.Capsule }).height(26).fontSize(12).fontFamily(this.appFontFamily('打开'))
-              .backgroundColor(hwPrimaryButton(this.isDarkMode)).fontColor(Color.White)
-              .onClick(() => this.openFile(file))
+    CardSurface({ radius: HwRadius.card }) {
+      Column({ space: 6 }) {
+        Text('已接收 ' + this.receivedFiles.length + ' 个文件').fontSize(14).fontWeight(FontWeight.Medium).fontFamily(this.appFontFamily('已接收 个文件')).fontColor(hwTextPrimary(this.isDarkMode))
+        ForEach(this.receivedFiles, (file: IncomingFile): void => {
+          Column({ space: 4 }) {
+            Row({ space: 8 }) {
+              Text(file.name).layoutWeight(1).fontSize(13).fontFamily(this.appFontFamily(file.name)).fontWeight(this.appFontWeight()).fontColor(hwTextPrimary(this.isDarkMode))
+                .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text(this.fileSizeText(file.size)).fontSize(12).fontFamily(this.appFontFamily(this.fileSizeText(file.size))).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
+              Button('打开', { type: ButtonType.Capsule }).height(26).fontSize(12).fontFamily(this.appFontFamily('打开'))
+                .backgroundColor(resolvePrimaryButtonColor(this.isDarkMode, this.accentOrPrimary())).fontColor(onAccentColor(this.accentOrPrimary()))
+                .onClick(() => this.openFile(file))
+            }.width('100%')
+            Text(file.savedPath).fontSize(11).fontFamily(this.appFontFamily(file.savedPath)).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
+              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
           }.width('100%')
-          Text(file.savedPath).fontSize(11).fontFamily(this.appFontFamily(file.savedPath)).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
-            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
-        }.width('100%')
-      }, (file: IncomingFile): string => file.savedPath + ':' + file.name)
+        }, (file: IncomingFile): string => file.savedPath + ':' + file.name + ':' + this.accentColor)
+      }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
   }
 
   @Builder
   selectFileCard() {
-    Row({ space: 12 }) {
-      Text('选择文件').fontSize(16).fontWeight(FontWeight.Medium).fontFamily(this.appFontFamily('选择文件')).fontColor(hwPrimary(this.isDarkMode)).layoutWeight(1)
-      Text(this.selectedFiles.length > 0 ? '已选择 ' + this.selectedFiles.length + ' 个文件' : '从系统选择要发送的文件')
-        .fontSize(12).fontFamily(this.appFontFamily('从系统选择要发送的文件')).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
-      SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(16).fontColor([hwTextSecondary(this.isDarkMode)])
+    CardSurface({ radius: HwRadius.card }) {
+      Row({ space: 12 }) {
+        Text('选择文件').fontSize(16).fontWeight(FontWeight.Medium).fontFamily(this.appFontFamily('选择文件')).fontColor(resolvePrimaryColor(this.isDarkMode, this.accentOrPrimary())).layoutWeight(1)
+        Text(this.selectedFiles.length > 0 ? '已选择 ' + this.selectedFiles.length + ' 个文件' : '从系统选择要发送的文件')
+          .fontSize(12).fontFamily(this.appFontFamily('从系统选择要发送的文件')).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
+        SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(16).fontColor([hwTextSecondary(this.isDarkMode)])
+      }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
+      .onClick(() => this.pickFiles())
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
-    .onClick(() => this.pickFiles())
   }
 
   @Builder
   manualSendCard() {
-    Column({ space: 10 }) {
-      Row({ space: 10 }) {
-        TextInput({ placeholder: 'Windows IP（如 192.168.0.118）', text: this.manualIp })
-          .layoutWeight(1).height(40).fontSize(14)
-          .onChange((value: string): void => {
-            this.manualIp = value;
-          });
-        Button('手动连接发送').height(40).fontSize(13).fontFamily(this.appFontFamily('手动连接发送'))
-          .backgroundColor(hwPrimaryButton(this.isDarkMode)).fontColor(Color.White)
-          .onClick(() => this.connectManualIp());
-      }.width('100%')
-      Text('手动指定 Windows IP 可跳过 UDP 发现，用于直接传输')
-        .fontSize(11).fontFamily(this.appFontFamily('手动指定 Windows IP 可跳过 UDP 发现，用于直接传输')).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode)).width('100%')
+    CardSurface({ radius: HwRadius.card }) {
+      Column({ space: 10 }) {
+        Row({ space: 10 }) {
+          TextInput({ placeholder: 'Windows IP（如 192.168.0.118）', text: this.manualIp })
+            .caretColor(this.accentOrPrimary())
+            .layoutWeight(1).height(40).fontSize(14)
+            .onChange((value: string): void => {
+              this.manualIp = value;
+            });
+          Button('手动连接发送').height(40).fontSize(13).fontFamily(this.appFontFamily('手动连接发送'))
+            .backgroundColor(resolvePrimaryButtonColor(this.isDarkMode, this.accentOrPrimary())).fontColor(onAccentColor(this.accentOrPrimary()))
+            .onClick(() => this.connectManualIp());
+        }.width('100%')
+        Text('手动指定 Windows IP 可跳过 UDP 发现，用于直接传输')
+          .fontSize(11).fontFamily(this.appFontFamily('手动指定 Windows IP 可跳过 UDP 发现，用于直接传输')).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode)).width('100%')
+      }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
   }
 
   private gotoReceive(): void {
@@ -258,7 +292,7 @@ struct NearSharing {
         paths: paths
       }
     }).catch((error: BusinessError): void => {
-      promptAction.showToast({ message: '打开接收记录失败：' + error.message });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '打开接收记录失败：' + error.message });
     });
   }
   private syncDevices(): void {
@@ -312,7 +346,7 @@ struct NearSharing {
   }
 
   private pickFiles(): void {
-    this.pickFilesNow().catch((error: BusinessError): void => promptAction.showToast({ message: '选择文件失败：' + error.message }));
+    this.pickFilesNow().catch((error: BusinessError): void => promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '选择文件失败：' + error.message }));
   }
 
   private pickFilesNow(): Promise<OutgoingFile[]> {
@@ -332,7 +366,7 @@ struct NearSharing {
         files = await this.pickFilesNow();
       } catch (error) {
         // 选择器本身抛错（如权限/系统页面异常）不静默吞掉，给用户明确反馈。
-        promptAction.showToast({ message: '选择文件失败：' + ((error as BusinessError).message ?? JSON.stringify(error)) });
+        promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '选择文件失败：' + ((error as BusinessError).message ?? JSON.stringify(error)) });
         return;
       }
       if (files.length === 0) {
@@ -358,30 +392,39 @@ struct NearSharing {
     const sender = this.hub?.windowsSender;
     if (this.selectedFiles.length === 0) {
       Lg.w('羊绒互传 WindowsNearby: send blocked: no file selected');
-      promptAction.showToast({ message: '请先选择文件' });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '请先选择文件' });
       return;
     }
     if (sender === undefined) {
       Lg.w('羊绒互传 WindowsNearby: send blocked: sender not ready');
-      promptAction.showToast({ message: 'Windows Nearby 发送器尚未就绪' });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: 'Windows Nearby 发送器尚未就绪' });
       return;
     }
     if (target.address.length === 0) {
       Lg.w('羊绒互传 WindowsNearby: send blocked: device has no IP (address empty)');
-      promptAction.showToast({ message: '等待 UDP 发现获取 Windows IP' });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '等待 UDP 发现获取 Windows IP' });
       return;
     }
-    const files: WindowsNearbyOutgoingFile[] = this.selectedFiles.map((file: OutgoingFile): WindowsNearbyOutgoingFile => ({
-      path: file.path,
-      name: file.name,
-      size: file.size
-    }));
-    sender.send(target.address, target.port > 0 ? target.port : 5040, files).then((): void => {
-      promptAction.showToast({ message: 'Windows Nearby 发送已完成' });
-      this.selectedFiles = [];
-      this.status = '已发现 ' + this.allDisplayDevices().length + ' 台 Windows 设备';
+    const ctx = getContext(this) as common.UIAbilityContext;
+    // 动态图片传输(Beta)：按对端品牌封装（Windows 对端固定走「图片 + 视频」拆分）。
+    DynamicPhotoService.prepareOutgoing(ctx, this.selectedFiles,
+      DynamicPhotoService.resolveFormatFor(target)).then((outgoing: OutgoingFile[]): void => {
+      const files: WindowsNearbyOutgoingFile[] = outgoing.map((file: OutgoingFile): WindowsNearbyOutgoingFile => ({
+        path: file.path,
+        name: file.name,
+        size: file.size
+      }));
+      sender.send(target.address, target.port > 0 ? target.port : 5040, files).then((): void => {
+        promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: 'Windows Nearby 发送已完成' });
+        const original = this.selectedFiles;
+        this.selectedFiles = [];
+        DynamicPhotoService.cleanupOutgoing(original, outgoing);
+        this.status = '已发现 ' + this.allDisplayDevices().length + ' 台 Windows 设备';
+      }).catch((error: Error): void => {
+        promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '发送失败：' + error.message });
+      });
     }).catch((error: Error): void => {
-      promptAction.showToast({ message: '发送失败：' + error.message });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '发送失败：' + error.message });
     });
   }
 
@@ -403,7 +446,7 @@ struct NearSharing {
       }
     }
     if (!valid) {
-      promptAction.showToast({ message: '请输入合法的 IPv4 地址' });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '请输入合法的 IPv4 地址' });
       return;
     }
     const id = 'manual-' + ip;
@@ -437,11 +480,11 @@ struct NearSharing {
         parameters: { 'ohos.aafwk.param.bundleName': 'com.cashmere.link' }
       }).catch((error: BusinessError): void => {
         Lg.e('Windows Nearby open file failed: ' + JSON.stringify(error));
-        promptAction.showToast({ message: '无法打开：' + (error.message ?? ''), duration: 2000 });
+        promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开：' + (error.message ?? ''), duration: 2000 });
       });
     } catch (error) {
       Lg.e('Windows Nearby open file error: ' + JSON.stringify(error));
-      promptAction.showToast({ message: '无法打开文件', duration: 2000 });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开文件', duration: 2000 });
     }
   }
 

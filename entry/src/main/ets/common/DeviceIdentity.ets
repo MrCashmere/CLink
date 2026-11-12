@@ -9,11 +9,19 @@ const MAX_ID_LEN = 64;
 
 export class DeviceIdentity {
   private static cached = '';
+  private static loading?: Promise<string>;
 
   static async load(context: common.Context): Promise<string> {
     if (DeviceIdentity.cached.length > 0) {
       return DeviceIdentity.cached;
     }
+    if (DeviceIdentity.loading === undefined) {
+      DeviceIdentity.loading = DeviceIdentity.readOrCreate(context);
+    }
+    return await DeviceIdentity.loading;
+  }
+
+  private static async readOrCreate(context: common.Context): Promise<string> {
     try {
       const store = await dataPreferences.getPreferences(context, STORE_NAME);
       const stored = await store.get(DEVICE_ID_KEY, '') as string;

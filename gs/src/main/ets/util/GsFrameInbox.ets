@@ -15,6 +15,7 @@ interface Waiter<T> {
 export class GsFrameInbox<T> {
   private readonly queued: Map<number, T[]> = new Map();
   private readonly waiters: Map<number, Waiter<T>[]> = new Map();
+  private ended?: Error;
 
   queuedCount(key: number): number {
     const queue = this.queued.get(key);
@@ -22,6 +23,7 @@ export class GsFrameInbox<T> {
   }
 
   deliver(key: number, value: T): void {
+    if (this.ended !== undefined) { return; }
     const pending = this.waiters.get(key);
     if (pending !== undefined) {
       while (pending.length > 0) {
@@ -51,6 +53,7 @@ export class GsFrameInbox<T> {
         return Promise.resolve(value);
       }
     }
+    if (this.ended !== undefined) { return Promise.reject(this.ended); }
     return new Promise<T>((resolve: (value: T) => void, reject: (error: Error) => void) => {
       let pending = this.waiters.get(key);
       if (pending === undefined) {
@@ -80,14 +83,24 @@ export class GsFrameInbox<T> {
     waiter.reject(new Error(`timeout waiting for frame ${key}`));
   }
 
+  end(error: Error): void {
+    this.ended = error;
+    this.rejectWaiters(error);
+  }
+
   reset(): void {
+    this.ended = undefined;
     this.queued.clear();
+    this.rejectWaiters(new Error('frame inbox reset'));
+  }
+
+  rejectWaiters(error: Error): void {
     this.waiters.forEach((pending: Waiter<T>[]) => {
       for (const waiter of pending) {
         if (!waiter.settled) {
           clearTimeout(waiter.timer);
           waiter.settled = true;
-          waiter.reject(new Error('frame inbox reset'));
+          waiter.reject(error);
         }
       }
     });

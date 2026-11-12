@@ -5,9 +5,10 @@
   "description": "羊绒互传入口模块",
   "main": "",
   "author": "",
-  "license": "GPL-3.0",
+  "license": "GPL-3.0-or-later",
   "dependencies": {
-    "gsproto": "file:../gs"
+    "gsproto": "file:../gs",
+    "libmta_core.so": "file:./src/main/cpp/types/libmta_core"
   },
   "devDependencies": {
     "@ohos/hypium": "1.0.21"

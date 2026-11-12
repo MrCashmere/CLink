@@ -13,9 +13,9 @@ import { ByteUtils } from '../../common/ByteUtils';
  *     `OfflineFrame` stream used by Quick Share over TCP.
  *
  * Byte layout is derived from the public Nearby Connections `/mediums` proto
- * (ble_frames.proto) and the open-source Weave framing. It is a re-implementation
- * for ArkTS of a publicly documented protocol, not copied source. UNVERIFIED
- * against stock Android until captured on-device.
+ * (ble_frames.proto) and the Bada/LibreDrop open-source Weave framing. It is a
+ * re-implementation for ArkTS of a publicly documented protocol, not copied
+ * source. UNVERIFIED against stock Android until captured on-device.
  */
 
 export const WEAVE_VERSION: number = 1;

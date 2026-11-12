@@ -1,0 +1,11 @@
+[package]
+name = "localsend"
+version = "1.18.2"
+edition = "2021"
+[dependencies]
+anyhow = "1"
+rsa = { version = "0.9.10", features = ["sha2"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
+x509-parser = { version = "0.18.1", features = ["verify"] }
+sha2 = "0.11.0"
+pem = "3"

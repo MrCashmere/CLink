@@ -6,154 +6,133 @@
 <title>局域网网页传输</title>
 <style>
   :root {
-    --bg: #0b0f14;
-    --card: #161b22;
-    --card-2: #1c222b;
-    --border: #2b3542;
-    --text: #e6edf3;
-    --text-dim: #9aa4b2;
-    --primary: #0a59f7;
-    --primary-2: #3b82f6;
-    --ok: #00aa72;
-    --danger: #d94838;
+    color-scheme: light dark;
+    --bg: #f1f3f5; --card: #fff; --card-2: #f7f9fc; --border: #e8ebef;
+    --text: #191c22; --text-dim: #69717d; --primary: #0a59f7; --primary-2: #0a59f7;
+    --tint: #edf3ff; --ok: #23834b; --danger: #c93629; --header: rgba(241,243,245,.88);
+    --space: 16px; --radius: 24px; --control-radius: 20px;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { height: 100%; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "HarmonyOS Sans SC", "Noto Sans CJK SC", sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    display: flex;
-    flex-direction: column;
-    min-height: 100vh;
-  }
-  header {
-    padding: 22px 20px 16px;
-    border-bottom: 1px solid var(--border);
-    background: var(--card);
-  }
+  * { box-sizing: border-box; }
+  html { min-width: 320px; background: var(--bg); }
+  body { margin: 0; color: var(--text); font-family: "HarmonyOS Sans SC", "HarmonyOS Sans", "HarmonyHeiTi", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+  button, input { font: inherit; }
+  button, a, [role="button"] { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+  button { cursor: pointer; border: 0; }
+  button:focus-visible, a:focus-visible, [role="button"]:focus-visible, summary:focus-visible { outline: 3px solid var(--primary); outline-offset: 4px; }
+  button:disabled { cursor: default; opacity: .4; }
+  .page-header { position: sticky; top: 0; z-index: 10; background: var(--header); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); }
+  .header-inner { max-width: 1008px; margin: auto; padding: 20px 24px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
   .brand { display: flex; align-items: center; gap: 12px; }
-  .logo {
-    width: 40px; height: 40px; border-radius: 12px;
-    background: linear-gradient(135deg, var(--primary), var(--primary-2));
-    display: flex; align-items: center; justify-content: center;
-    font-size: 20px; font-weight: 700; color: #fff;
-  }
-  .title { font-size: 17px; font-weight: 600; }
-  .subtitle { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
-  .device-banner {
-    margin-top: 14px;
-    display: flex; align-items: center; gap: 8px;
-    font-size: 13px; color: var(--ok);
-  }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); }
-  main { flex: 1; padding: 20px; display: flex; flex-direction: column; gap: 16px; max-width: 640px; width: 100%; margin: 0 auto; }
-  .drop-zone {
-    border: 2px dashed var(--border);
-    border-radius: 16px;
-    padding: 30px 20px;
-    text-align: center;
-    background: var(--card);
-    transition: border-color .15s, background .15s;
-    cursor: pointer;
-  }
-  .drop-zone.dragover { border-color: var(--primary-2); background: var(--card-2); }
-  .drop-ico { font-size: 34px; color: var(--primary-2); }
-  .drop-text { margin-top: 10px; font-size: 15px; color: var(--text); }
-  .drop-hint { margin-top: 6px; font-size: 12px; color: var(--text-dim); }
-  .file-list { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; }
-  .file-item {
-    display: flex; align-items: center; gap: 10px;
-    background: var(--card-2); border: 1px solid var(--border);
-    border-radius: 10px; padding: 10px 12px; font-size: 13px; text-align: left;
-  }
-  .file-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .file-item .size { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
-  .file-item .rm { color: var(--danger); font-size: 16px; padding: 0 4px; cursor: pointer; flex: none; }
-  .file-item.pending .name { color: var(--text-dim); }
-  .file-item.done { border-color: var(--ok); }
-  .file-item.failed { border-color: var(--danger); }
-  .file-item .st { font-size: 12px; min-width: 40px; text-align: right; color: var(--text-dim); }
+  .logo { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 14px; color: #fff; background: var(--primary); font-weight: 600; font-size: 22px; }
+  .brand-name { font-size: 16px; font-weight: 600; }
+  .brand-note, .header-tag { font-size: 12px; color: var(--text-dim); }
+  .header-tag { padding: 6px 12px; background: var(--card); border-radius: 20px; white-space: nowrap; }
+  main { max-width: 1008px; margin: auto; padding: 24px 24px max(32px, env(safe-area-inset-bottom)); }
+  .intro { margin: 8px 0 24px; }
+  h1 { margin: 0 0 8px; font-size: 20px; line-height: 28px; font-weight: 700; }
+  .subtitle { margin: 0; font-size: 14px; color: var(--text-dim); }
+  .device-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; background: var(--card); border-radius: var(--radius); padding: 20px 24px; margin-bottom: 24px; }
+  .device-info { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .device-monogram { flex: 0 0 40px; height: 40px; display: grid; place-items: center; border-radius: 50%; background: var(--tint); color: var(--primary); font-size: 14px; font-weight: 500; }
+  .device-label { font-size: 12px; color: var(--text-dim); margin-bottom: 2px; }
+  #deviceName { font-size: 16px; font-weight: 500; overflow-wrap: anywhere; }
+  .connection-pill { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ok); white-space: nowrap; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .device-banner[data-state="pending"] .connection-pill { color: var(--text-dim); }
+  .device-banner[data-state="offline"] .connection-pill { color: var(--danger); }
+  .transfer-grid { display: grid; grid-template-columns: 1.1fr 1fr; align-items: start; gap: 16px; }
+  .panel { background: var(--card); border-radius: var(--radius); padding: 24px; min-width: 0; }
+  .section-head, .share-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; }
+  h2, .share-title { font-size: 16px; line-height: 24px; margin: 0; font-weight: 600; }
+  .section-caption { color: var(--text-dim); font-size: 12px; margin: 4px 0 0; }
+  .drop-zone { border: 1px dashed #b7cafa; border-radius: 20px; padding: 24px 16px; text-align: center; background: var(--card-2); transition: background .2s, border-color .2s; cursor: pointer; }
+  .drop-zone:hover, .drop-zone.dragover { border-color: var(--primary); background: var(--tint); }
+  .drop-zone[aria-disabled="true"] { opacity: .6; cursor: default; }
+  .drop-ico { width: 56px; height: 56px; margin: 0 auto 12px; border-radius: 50%; display: grid; place-items: center; background: var(--tint); color: var(--primary); font-size: 28px; font-weight: 400; }
+  .drop-text { font-size: 14px; font-weight: 500; }
+  .drop-hint { color: var(--text-dim); font-size: 12px; margin: 4px 0 16px; }
+  .choose-btn, .share-refresh, .dl { min-height: 40px; padding: 8px 20px; background: var(--tint); color: var(--primary); border-radius: 20px; font-weight: 500; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
+  .choose-btn:hover, .share-refresh:hover, .dl:hover { filter: brightness(.96); }
+  .selection-summary { margin-top: 16px; color: var(--text-dim); font-size: 12px; }
+  .file-list, .share-list { display: flex; flex-direction: column; margin-top: 8px; }
+  .file-item, .share-item { position: relative; display: flex; align-items: center; gap: 8px; min-height: 64px; padding: 12px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
+  .file-item .name, .share-item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-item .size, .share-item .size { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
+  .file-item .rm { color: var(--text-dim); background: transparent; min-width: 36px; min-height: 40px; font-size: 22px; padding: 0; border-radius: 20px; }
+  .file-item .rm:hover { background: var(--card-2); }
+  .file-item .st { font-size: 12px; min-width: 36px; text-align: right; color: var(--text-dim); }
+  .file-item.pending::after { position: absolute; content: ''; left: 0; bottom: 0; height: 2px; width: var(--progress, 0%); background: var(--primary); transition: width .2s; }
   .file-item.done .st { color: var(--ok); }
   .file-item.failed .st { color: var(--danger); }
-  .send-btn {
-    margin-top: 18px; width: 100%; height: 46px;
-    border: none; border-radius: 12px; cursor: pointer;
-    background: var(--primary); color: #fff; font-size: 15px; font-weight: 600;
-    transition: opacity .15s, transform .05s;
-  }
-  .send-btn:disabled { opacity: .45; cursor: default; }
-  .send-btn:active:not(:disabled) { transform: scale(.99); }
-  .status-area { text-align: center; font-size: 13px; color: var(--text-dim); min-height: 20px; }
+  .send-btn { margin-top: 20px; width: 100%; min-height: 48px; padding: 12px 20px; border-radius: 24px; background: var(--primary); color: #fff; font-size: 16px; font-weight: 500; transition: opacity .2s, transform .15s; }
+  .send-btn:active:not(:disabled), .choose-btn:active { transform: scale(.98); }
+  .status-area { margin-top: 12px; color: var(--text-dim); font-size: 12px; line-height: 20px; text-align: center; overflow-wrap: anywhere; }
+  .status-area:empty { display: none; }
   .status-area.err { color: var(--danger); }
   .status-area.ok { color: var(--ok); }
-  .note {
-    font-size: 12px; color: var(--text-dim); line-height: 1.6;
-    background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px;
+  .share-refresh { padding: 6px 12px; font-size: 12px; min-height: 36px; }
+  .share-empty { text-align: center; padding: 36px 8px 44px; color: var(--text-dim); font-size: 12px; }
+  .empty-mark { margin: 0 auto 16px; width: 56px; height: 56px; border-radius: 50%; display: grid; place-items: center; background: var(--card-2); font-size: 24px; color: var(--text-dim); }
+  .empty-title { color: var(--text); font-size: 14px; margin-bottom: 6px; }
+  .share-item .dl { font-size: 12px; padding: 8px 16px; flex: none; }
+  .note { margin-top: 24px; padding: 0 4px; color: var(--text-dim); font-size: 12px; line-height: 1.8; }
+  .note summary { cursor: pointer; color: var(--text); font-size: 14px; font-weight: 500; padding: 8px 0; }
+  .note ol { margin: 8px 0 0; padding-left: 20px; }
+  .note li + li { margin-top: 6px; }
+  .footer-note { margin: 24px 0 0; text-align: center; font-size: 12px; color: var(--text-dim); }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #191a1c; --card: #242628; --card-2: #2e3033; --border: #3c3e42; --text: #eeeef0; --text-dim: #afb2bb; --primary: #317af7; --primary-2: #8ab4ff; --tint: #293954; --ok: #7bc88e; --danger: #ff9285; --header: rgba(25,26,28,.88); }
+    .drop-zone { border-color: #4d6387; }
+    .choose-btn, .share-refresh, .dl { color: #a9c9ff; }
   }
-  .note b { color: var(--text); }
-  .share-section {
-    background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+  @media (max-width: 700px) {
+    .header-inner { padding: 16px; } main { padding: 16px 16px max(24px, env(safe-area-inset-bottom)); }
+    .intro { margin: 8px 0 20px; } .transfer-grid { grid-template-columns: 1fr; }
+    .device-banner { padding: 16px; margin-bottom: 16px; } .panel { padding: 20px; }
+    .connection-pill { font-size: 11px; } .header-tag { padding: 6px 10px; }
   }
-  .share-head { display: flex; align-items: center; justify-content: space-between; }
-  .share-title { font-size: 14px; font-weight: 600; color: var(--text); }
-  .share-refresh {
-    font-size: 12px; color: var(--primary-2); cursor: pointer; background: none;
-    border: none; padding: 2px 6px;
-  }
-  .share-empty { margin-top: 10px; font-size: 12px; color: var(--text-dim); }
-  .share-list { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
-  .share-item {
-    display: flex; align-items: center; gap: 10px;
-    background: var(--card-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 13px;
-  }
-  .share-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .share-item .size { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
-  .share-item .dl {
-    flex: none; font-size: 13px; font-weight: 600; color: #fff; text-decoration: none;
-    background: var(--primary); border-radius: 8px; padding: 7px 16px;
-  }
-  .share-item .dl:active { opacity: .8; }
-  @media (max-width: 480px) { main { padding: 14px; } }
+  @media (prefers-reduced-motion: reduce) { *, *::after { transition: none !important; } }
 </style>
 </head>
 <body>
-<header>
-  <div class="brand">
-    <div class="logo">羊</div>
-    <div>
-      <div class="title">局域网网页传输</div>
-      <div class="subtitle">在浏览器中直接向本机发送文件</div>
-    </div>
+<header class="page-header">
+  <div class="header-inner">
+    <div class="brand"><div class="logo" aria-hidden="true">羊</div><div><div class="brand-name">羊绒互传</div><div class="brand-note">文件，在设备间自由流转</div></div></div>
+    <span class="header-tag">无需安装 · 即开即传</span>
   </div>
-  <div class="device-banner"><span class="dot"></span><span id="deviceName">正在连接本机…</span></div>
 </header>
 <main>
-  <div id="dropZone" class="drop-zone">
-    <div class="drop-ico">⬆</div>
-    <div class="drop-text">点击选择文件，或将文件拖到这里</div>
-    <div class="drop-hint">支持一次选择多个文件；发送前需在本机确认</div>
-    <input type="file" id="fileInput" multiple hidden>
-    <div id="fileList" class="file-list"></div>
-    <button id="sendBtn" class="send-btn" type="button" disabled>发送到本机</button>
+  <div class="intro"><h1>局域网网页传输</h1><p class="subtitle">连接同一网络，在浏览器与设备之间轻松分享。</p></div>
+  <section class="device-banner" id="connectionState" data-state="pending" aria-label="接收设备">
+    <div class="device-info"><span class="device-monogram" aria-hidden="true">设备</span><div><div class="device-label">正在连接的设备</div><div id="deviceName">连接中…</div></div></div>
+    <div class="connection-pill"><span class="dot" aria-hidden="true"></span><span id="connectionLabel">正在连接</span></div>
+  </section>
+  <div class="transfer-grid">
+    <section class="panel" aria-labelledby="sendTitle">
+      <div class="section-head"><div><h2 id="sendTitle">发送到设备</h2><p class="section-caption">选择文件，在接收设备上确认即可开始</p></div></div>
+      <div id="dropZone" class="drop-zone" role="button" tabindex="0" aria-label="选择或拖入要发送的文件" aria-disabled="false">
+        <div class="drop-ico" aria-hidden="true">↑</div><div class="drop-text">把文件拖到这里</div><div class="drop-hint">照片、视频、文档，支持多个文件</div>
+        <button id="chooseBtn" class="choose-btn" type="button">选择文件</button>
+      </div>
+      <input type="file" id="fileInput" multiple hidden>
+      <div id="selectionSummary" class="selection-summary">尚未选择文件</div>
+      <div id="fileList" class="file-list" aria-label="待发送文件"></div>
+      <button id="sendBtn" class="send-btn" type="button" disabled>发送到设备</button>
+      <div id="status" class="status-area" role="status" aria-live="polite"></div>
+    </section>
+    <section class="panel share-section" aria-labelledby="receiveTitle">
+      <div class="share-head"><div><h2 id="receiveTitle" class="share-title">从设备下载</h2><p class="section-caption">设备共享的文件会出现在这里</p></div><button id="shareRefresh" class="share-refresh" type="button">刷新</button></div>
+      <div id="shareEmpty" class="share-empty"><div class="empty-mark" aria-hidden="true">↓</div><div class="empty-title">这里还没有文件</div><div>在设备的应用中选择<br>「发送文件到网页端」后即可下载</div></div>
+      <div id="shareList" class="share-list" aria-label="可下载文件"></div>
+    </section>
   </div>
-  <div id="status" class="status-area"></div>
-  <div class="share-section">
-    <div class="share-head">
-      <div class="share-title">从本机下载文件</div>
-      <button id="shareRefresh" class="share-refresh" type="button">刷新</button>
-    </div>
-    <div id="shareEmpty" class="share-empty">本机暂未开放可下载文件</div>
-    <div id="shareList" class="share-list"></div>
-  </div>
-  <div class="note">
-    使用说明：<br>
-    1. 本机（收到文件的设备）保持此页面所在应用已打开，并能正常接收。<br>
-    2. 在 <b>同一局域网</b> 内打开本链接，选择文件后点「发送到本机」。<br>
-    3. 本机弹窗确认后，文件即传输到本机存储中。<br>
-    4. 反之，本机若在 App 内选择文件「发送文件到网页端」，也可在上方列表中下载。<br>
-    <span style="opacity:.8">注意：若提示连接失败，请确认两设备在同一 Wi-Fi 网络，且手机未开启拦截。</span>
-  </div>
+  <details class="note"><summary>传输小提示</summary><ol>
+    <li>两台设备需连接同一局域网，并保持接收设备上的羊绒互传已打开。</li>
+    <li>发送前，请在接收设备上确认本次请求；设置了接收 PIN 时，按提示输入。</li>
+    <li>动态照片和 HDR 照片会按接收设备适配，下载的文件名或格式可能有所变化。</li>
+    <li>连接失败时，请确认网络可达，然后刷新页面重试。</li>
+  </ol></details>
+  <p class="footer-note">羊绒互传 · 让分享更简单</p>
 </main>
 <script>
 (function () {
@@ -200,9 +179,13 @@
 
   function loadInfo() {
     fetchInfo().then(function (info) {
-      deviceNameEl.textContent = (info.alias ? info.alias : '本机') + ' · 可接收文件';
+      deviceNameEl.textContent = info.alias || '接收设备';
+      document.getElementById('connectionState').dataset.state = 'online';
+      document.getElementById('connectionLabel').textContent = '可以接收文件';
     }).catch(function () {
-      deviceNameEl.textContent = '本机未响应，请确认应用已打开';
+      deviceNameEl.textContent = '设备暂时未响应';
+      document.getElementById('connectionState').dataset.state = 'offline';
+      document.getElementById('connectionLabel').textContent = '连接中断';
     });
   }
   loadInfo();
@@ -218,10 +201,14 @@
     for (var i = 0; i < files.length; i++) {
       var f = files[i];
       var url = API_BASE + '/share/download?id=' + encodeURIComponent(f.id);
+      // 刻意**不写** `download="…"` 属性：本机会按浏览器 UA 把动态照片/HDR 改写成对端设备认的形态，
+      // 改写后扩展名可能变（如 .heic → .jpg）。若固定 download 文件名，浏览器会用它覆盖服务端
+      // `Content-Disposition` 里的真实文件名，用户就会拿到一个「名字是 .heic、内容其实是 JPEG」的文件。
+      // 交给服务端定名，浏览器照样下载（响应用 application/octet-stream + attachment）。
       html += '<div class="share-item">' +
         '<span class="name" title="' + esc(f.name) + '">' + esc(f.name) + '</span>' +
         '<span class="size">' + fmtSize(f.size) + '</span>' +
-        '<a class="dl" href="' + url + '" download="' + esc(f.name) + '">下载</a>' +
+        '<a class="dl" href="' + url + '">下载</a>' +
         '</div>';
     }
     shareList.innerHTML = html;
@@ -250,7 +237,7 @@
         '<span class="name" title="' + esc(p.file.name) + '">' + esc(p.file.name) + '</span>' +
         '<span class="size">' + fmtSize(p.file.size) + '</span>' +
         '<span class="st">' + (p.stateDesc || '') + '</span>' +
-        '<span class="rm" title="移除">×</span>';
+        '<button class="rm" type="button" aria-label="移除 ' + esc(p.file.name) + '">×</button>';
       item.querySelector('.rm').addEventListener('click', function (ev) {
         ev.stopPropagation();
         if (sending) return;
@@ -267,10 +254,17 @@
   }
 
   function updateSendBtn() {
+    var count = pending.filter(function (p) { return !p.removed; }).length;
+    var total = pending.reduce(function (n, p) { return n + (p.removed ? 0 : p.file.size); }, 0);
+    document.getElementById('selectionSummary').textContent = count ? count + ' 个文件 · ' + fmtSize(total) : '尚未选择文件';
+    document.getElementById('chooseBtn').disabled = sending;
+    dropZone.setAttribute('aria-disabled', String(sending));
+    sendBtn.textContent = sending ? '正在发送…' : (count ? '发送 ' + count + ' 个文件' : '发送到设备');
     sendBtn.disabled = sending || pending.length === 0 || pending.some(function (p) { return p.removed; });
   }
 
   function addFiles(files) {
+    if (sending) return;
     Array.prototype.forEach.call(files, function (f) {
       // 防止浏览器重复选择同一文件（如点击「发送到本机」冒泡打开选择器后再次选择）导致同一
       // 文件被重复加入待发送列表、进而重复上传。
@@ -293,9 +287,18 @@
   // 仅当点击的是 dropZone 本身的提示区时才打开选择器；点按钮或文件列表行不触发，
   // 避免「发送到本机」按钮的点击冒泡到 dropZone 再次打开文件选择器（造成重复选文件/重复上传）。
   dropZone.addEventListener('click', function (e) {
+    if (sending) return;
     if (e.target && e.target.closest && e.target.closest('button')) return;
     if (e.target && e.target.closest && e.target.closest('.file-item')) return;
     fileInput.click();
+  });
+  document.getElementById('chooseBtn').addEventListener('click', function (e) {
+    e.stopPropagation(); if (!sending) fileInput.click();
+  });
+  dropZone.addEventListener('keydown', function (e) {
+    if (e.target === dropZone && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault(); if (!sending) fileInput.click();
+    }
   });
   fileInput.addEventListener('change', onFilesChosen);
   ['dragenter', 'dragover'].forEach(function (ev) {
@@ -385,6 +388,7 @@
           var pct = Math.floor(e.loaded / e.total * 100);
           p.stateEl.textContent = pct + '%';
           p.stateDesc = pct + '%';
+          p.itemEl.style.setProperty('--progress', pct + '%');
         }
       };
       xhr.onload = function () {

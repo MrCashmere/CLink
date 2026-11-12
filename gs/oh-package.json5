@@ -2,7 +2,7 @@
   "modelVersion": "6.1.1",
   "name": "gsproto",
   "version": "1.0.0",
-  "description": "GPL v3 protocol module: Quick Share + Windows Nearby (MS-CDP aligned)",
+  "description": "GPL v3 protocol module: Quick Share (Bada-aligned) + Windows Nearby (MS-CDP aligned)",
   "main": "Index.ets",
   "author": "",
   "license": "GPL-3.0-only",

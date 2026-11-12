@@ -7,14 +7,15 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import promptAction from '@ohos.promptAction';
 import { CertificateStore } from './CertificateStore';
 import { SettingsStore } from './SettingsStore';
-import { DeviceIdentity } from './DeviceIdentity';
 import { PinDialogGuard } from './PinDialogGuard';
 import { getLocalIpv4 } from './NetAddress';
+import { HotspotAddressResolver } from '../service/HotspotAddressResolver';
 import { HwColor } from '../utils/DesignTokens';
 import { LocalSendDiscovery } from '../service/LocalSendDiscovery';
 import { TransferManager } from '../service/TransferManager';
-import { LocalSendServer } from '../protocol/localsend/LocalSendServer';
-import { createGsFacade, GsFacade, GsReceiveHooks, GS_QUICKSHARE_PORT, WifiDirectUpgradeCredentials } from '../protocol/gs/GsFacade';
+import { LocalSendServer, LocalSendPeerSignal } from '../protocol/localsend/LocalSendServer';
+import { createGsFacade, GsFacade, GsReceiveHooks, GS_QUICKSHARE_PORT, WifiDirectUpgradeCredentials, GsTransportChange } from '../protocol/gs/GsFacade';
+import { DynamicPhotoService, IncomingFileLike } from './DynamicPhotoService';
 import { IncomingFile, SessionFileMeta } from '../model/TransferModels';
 import { QuickShareEventEmitter, QuickShareServiceEvent, IncomingSessionHandler } from '../quickshare/utils/EventEmitter';
 import { QuickShareTransferHistory } from '../quickshare/storage/TransferHistory';
@@ -22,11 +23,20 @@ import { NearbyBleMedium } from '../quickshare/discovery/NearbyBleMedium';
 import { NearbyP2pDirect, P2pGroupCredentials } from '../quickshare/ble/NearbyP2pDirect';
 import { SecurityUtils } from './SecurityUtils';
 import { GsStreamConnection } from '../protocol/gs/GsFacade';
+import { toastSystemMaterial, dialogSystemMaterial } from '../utils/SystemMaterial';
+import { GalleryAutoSaveService } from '../quickshare/service/GalleryAutoSaveService';
 
 export interface LocalsendWebLinkInfo {
   readonly address: string;
   readonly port: number;
   readonly scheme: string;
+}
+
+/** LocalSend 原生协议下「本机作为接收端」的地址：IP + 真实监听端口 + 是否走 HTTPS。 */
+export interface LocalsendSelfEndpoint {
+  readonly address: string;
+  readonly port: number;
+  readonly https: boolean;
 }
 
 export class AppServices {
@@ -37,9 +47,12 @@ export class AppServices {
   /** App 级 Quick Share 接收事件总线：页面 open 时订阅，close 只退订不断开监听。 */
   readonly quickShareEvents: QuickShareEventEmitter<QuickShareServiceEvent> = new QuickShareEventEmitter<QuickShareServiceEvent>();
   private running = false;
+  private receiveGeneration: number = 0;
   private startPromise?: Promise<void>;
   private gsQuickshare?: GsFacade;
   private gsQuickshareReady = false;
+  /** Quick Share 接收端启动失败原因（空串 = 正常监听）：页面据此给出可见提示。 */
+  private quickShareReceiveErrorText: string = '';
   private quickShareStartPromise?: Promise<void>;
   private incomingSessionHandler?: IncomingSessionHandler;
   private lastPeerName: string = '';
@@ -52,7 +65,6 @@ export class AppServices {
   private nearbyBleMedium?: NearbyBleMedium;
   private nearbyP2p?: NearbyP2pDirect;
   private bleEndpointId: string = '';
-  private lastPeerBleMac: string = '';
   private keepAliveActive = false;
   /** 通知授权是否已请求过（避免每次启动都重复弹窗）。 */
   private notificationRequested = false;
@@ -77,24 +89,26 @@ export class AppServices {
 
   /** 首页只保证接收能力，不主动扫描附近设备。 */
   async startReceive(): Promise<void> {
-    if (this.running && this.gsQuickshareReady) {
-      return;
-    }
-    if (this.startPromise !== undefined) {
+    const generation = this.receiveGeneration;
+    while (this.startPromise !== undefined) {
       await this.startPromise;
-      return;
+      if (generation !== this.receiveGeneration) { return; }
     }
-    const promise = this.doStartReceive();
+    if (this.running && this.gsQuickshareReady) { return; }
+    const promise = this.doStartReceive(generation);
     this.startPromise = promise;
     try {
       await promise;
     } finally {
-      this.startPromise = undefined;
+      if (this.startPromise === promise) {
+        this.startPromise = undefined;
+      }
     }
   }
 
-  private async doStartReceive(): Promise<void> {
+  private async doStartReceive(generation: number): Promise<void> {
     await SettingsStore.load(this.context);
+    if (generation !== this.receiveGeneration) { return; }
     // 开着长时任务保活时，先确保本应用允许发布通知——连续任务的通知由系统自动发布，
     // 但若通知权限未开启会报 1600020/9800006 而不显示。这里在前台启动时申请一次。
     await this.ensureKeepAliveNotificationPermission();
@@ -106,15 +120,36 @@ export class AppServices {
         Lg.w('[KEEPALIVE] prebuild wantAgent failed: ' + JSON.stringify(error));
       }
     }
-    await this.certs.ensure();
-    await this.refreshAliasFingerprint();
+    if (generation !== this.receiveGeneration) { return; }
     if (!this.running) {
       await this.transfer.startServer();
+      if (generation !== this.receiveGeneration) { return; }
       this.localsend.setHttps(LocalSendServer.lastHttpsActive);
       this.localsend.setPort(LocalSendServer.actualPort);
+      await this.refreshAliasFingerprint();
+      if (generation !== this.receiveGeneration) { return; }
       this.running = true;
       this.localsend.startReceiveOnly();
+      // HTTP 层的对端身份信号（/register、/send-request）→ 发现链路兜底：
+      // 热点模式下组播收包不可靠（中继依赖系统放行），这条 TCP 单播通道是
+      // 「对端主动告诉本机我在这里」的最稳信号 —— 对端能 POST 进来就说明它发现了本机。
+      LocalSendServer.onPeerSignal = (signal: LocalSendPeerSignal): void => {
+        this.localsend.emitExternal({
+          id: 'localsend:' + signal.address + ':' + signal.port,
+          name: signal.alias,
+          model: signal.deviceModel,
+          protocol: 'localsend',
+          address: signal.address,
+          port: signal.port,
+          https: signal.protocol.toLowerCase() !== 'http',
+          fingerprint: signal.fingerprint,
+          source: 'lan'
+        });
+      };
     }
+    // 预热热点地址探测：开热点时系统枚举常看不到 SoftAP，只给蜂窝地址（10.x），
+    // 那个地址连着热点的电脑访问不到。这里先探一次，UI 生成访问链接时才有正确地址可用。
+    void HotspotAddressResolver.resolve(LocalSendServer.actualWebPort);
     // Quick Share 接收端与应用同生命周期：App 进程在前台/主页即监听，不随 QuickShare
     // 页面启停（对齐 LocalSend 的稳定可收），且不申请任何后台常驻任务/通知。
     await this.startQuickShareReceive();
@@ -168,16 +203,67 @@ export class AppServices {
     this.localsend.stopScan();
   }
 
-  /** 局域网网页传输：本机网页端服务运行的地址与端口（始终明文 HTTP，供浏览器访问）。 */
+  /** 局域网网页传输：本机网页端服务运行的地址与端口（始终明文 HTTP，供浏览器访问）。
+   *  网页监听全部端口都启动失败时 actualWebPort 被置 0，这里返回空地址，
+   *  避免 UI 拼出 `http://IP:0` 这种不可用地址（具体原因见 LocalSendServer 的错误日志）。 */
   localsendWebLink(): LocalsendWebLinkInfo {
-    const address = this.localsend.getLocalAddress().length > 0
-      ? this.localsend.getLocalAddress()
-      : getLocalIpv4();
+    if (LocalSendServer.actualWebPort <= 0) {
+      return { address: '', port: 0, scheme: 'http' };
+    }
+    // 热点场景优先用热点地址：系统枚举（localsend.getLocalAddress / getLocalIpv4）
+    // 在开热点时通常只能看到蜂窝地址（如 192.0.2.10），而连接本热点的电脑在 192.168.43.0/24，
+    // 拿蜂窝地址拼出来的链接电脑是访问不到的。
+    // 取值分两级：探测确认过的地址 → 热点开着时的即时答案（不等探测）→ 普通 Wi-Fi 地址。
+    void HotspotAddressResolver.resolve(LocalSendServer.actualWebPort);
     return {
-      address: address,
+      address: this.preferredAddress(),
       port: LocalSendServer.actualWebPort,
       scheme: 'http'
     };
+  }
+
+  /** 本机对外地址：热点地址（已确认 → 即时答案）优先，否则回落到系统枚举的局域网地址。 */
+  private preferredAddress(): string {
+    const hotspot: string = HotspotAddressResolver.bestAddress();
+    if (hotspot.length > 0) {
+      return hotspot;
+    }
+    return this.localsend.getLocalAddress().length > 0
+      ? this.localsend.getLocalAddress()
+      : getLocalIpv4();
+  }
+
+  /** 页面展示用的本机地址（首页副标题等），与网页传输链接取同一套热点优先逻辑。 */
+  displayAddress(): string {
+    return this.preferredAddress();
+  }
+
+  /** 订阅热点地址确认事件：探测命中后立刻回调，页面不必等 5 秒刷新周期。 */
+  onHotspotAddressChange(listener: (address: string) => void): void {
+    HotspotAddressResolver.onResolved(listener);
+  }
+
+  offHotspotAddressChange(listener: (address: string) => void): void {
+    HotspotAddressResolver.offResolved(listener);
+  }
+
+  /** LocalSend 原生协议的本机接收端点（`IP:端口`）。
+   *  用途：电脑端 LocalSend 用「手动发送 / 收藏设备」直连本机。热点、跨网段、组播被拦等
+   *  发现机制失效的场景下，这是让对端主动发过来的唯一可靠入口 —— 不依赖 mDNS 或组播。
+   *  端口取真实监听值（不是协议默认 53317），监听失败时为 0，UI 需按空处理。 */
+  localsendSelfEndpoint(): LocalsendSelfEndpoint {
+    const port: number = LocalSendServer.actualPort;
+    if (port <= 0) {
+      return { address: '', port: 0, https: false };
+    }
+    void HotspotAddressResolver.resolve(port);
+    return { address: this.preferredAddress(), port: port, https: LocalSendServer.lastHttpsActive };
+  }
+
+  /** Quick Share 接收端启动失败原因；空串表示 53318 正在正常监听。
+   *  历史上该端口曾被「局域网网页传输」的明文 HTTP 监听抢占，导致能发现却收不到文件。 */
+  quickShareReceiveFault(): string {
+    return this.quickShareReceiveErrorText;
   }
 
   /** 页面订阅接收确认回调（弹窗），页面未打开时回退为静默接收。 */
@@ -191,19 +277,14 @@ export class AppServices {
 
   /** 开启 Quick Share BLE GATT socket 服务，让 TCP 不可达的 stock 对端也能 bootstrap。 */
   async startQuickShareBle(): Promise<void> {
+    const generation = this.receiveGeneration;
     await this.startQuickShareReceive();
-    if (this.nearbyBleMedium !== undefined) {
-      return;
-    }
+    if (generation !== this.receiveGeneration) { return; }
     if (this.gsQuickshare === undefined) {
       Lg.w('[QUICKSHARE] startQuickShareBle skipped: receiver not ready');
       return;
     }
-    const medium = new NearbyBleMedium();
-    medium.setOnSessionStart((deviceId: string): void => {
-      this.lastPeerBleMac = deviceId;
-      Lg.i('[QUICKSHARE] BLE session accepted from ' + deviceId + ' (cached for send)');
-    });
+    const medium: NearbyBleMedium = this.nearbyBleMedium ?? new NearbyBleMedium();
     medium.setOnConnection((conn: GsStreamConnection): void => {
       if (this.gsQuickshare !== undefined) {
         this.gsQuickshare.runReceiveStream(conn, this.buildQuickShareHooks())
@@ -211,9 +292,9 @@ export class AppServices {
             Lg.w('[QUICKSHARE] BLE stream receiver failed: ' + error.message);
           });
       }
-      // BLE socket 建立说明对端未能走 WIFI_LAN（TCP 失败后降级）：
-      // 若开启「WLAN 直连优先模式」，随即建 Wi-Fi Direct 组供对端升级。
-      if (SettingsStore.current().quickshareWlanDirect) {
+      // BLE socket 建立说明对端未能走 WIFI_LAN（TCP 失败后降级）：除「仅局域网」模式外，
+      // 随即建 Wi-Fi Direct 组供对端升级（auto/direct 都允许；direct 只是更早、更主动）。
+      if (SettingsStore.current().quickshareTransport !== 'lan') {
         this.startQuickShareWlanDirect()
           .catch((error: Error): void => {
             Lg.w('[QUICKSHARE] WLAN Direct group after BLE bootstrap failed: ' + error.message);
@@ -224,18 +305,14 @@ export class AppServices {
     if (this.bleEndpointId.length === 0) {
       this.bleEndpointId = SecurityUtils.createToken().slice(0, 4);
     }
-    await medium.start(this.bleEndpointId, SettingsStore.current().alias);
-    Lg.i('[QUICKSHARE] Quick Share BLE GATT socket active endpointId=' + this.bleEndpointId);
+    const active: boolean = await medium.start(this.bleEndpointId, SettingsStore.current().alias);
+    Lg.i('[QUICKSHARE] Quick Share BLE GATT socket ' + (active ? 'active' : 'waiting for Bluetooth')
+      + ' endpointId=' + this.bleEndpointId);
   }
 
   stopQuickShareBle(): void {
     this.nearbyBleMedium?.stop();
     this.nearbyBleMedium = undefined;
-  }
-
-  /** 最近一次经 BLE GATT 连入的对端 MAC；若对端未被 BLE 扫描发现，可用于 BLE 发送。 */
-  lastPeerBleMacValue(): string {
-    return this.lastPeerBleMac;
   }
 
   /** 设置/降级触发：创建 Wi-Fi Direct 组（GO），返回凭据以交给对端升级。 */
@@ -261,9 +338,7 @@ export class AppServices {
   }
 
   stop(): void {
-    if (!this.running) {
-      return;
-    }
+    this.receiveGeneration += 1;
     this.running = false;
     this.stopContinuousTask().catch((): void => undefined);
     this.localsend.stop();
@@ -277,6 +352,7 @@ export class AppServices {
     this.nearbyP2p?.removeGroup();
     this.nearbyP2p = undefined;
     this.gsQuickshareReady = false;
+    this.quickShareReceiveErrorText = '';
     this.incomingSessionHandler = undefined;
     this.quickShareEvents.clear();
   }
@@ -290,9 +366,8 @@ export class AppServices {
    */
   async restartReceive(): Promise<void> {
     Lg.i('[SERVICES] restartReceive: 停止接收侧并按冷启动路径重启');
-    // 清掉进行中的启动 promise，避免复用到旧的启动结果。
-    this.startPromise = undefined;
-    this.quickShareStartPromise = undefined;
+    // 旧启动先结束；代次校验会丢弃它的结果，避免异步回调复活已关闭的监听。
+    this.receiveGeneration += 1;
     this.running = false;
     this.gsQuickshareReady = false;
     try {
@@ -319,10 +394,9 @@ export class AppServices {
     Lg.i('[SERVICES] restartReceive done');
   }
 
-  /** 初始化本机 LocalSend 指纹：使用打包证书的 SHA-256 指纹（与 HTTPS 证书一致），便于对端做指纹识别。 */
+  /** 用当前监听协议的身份更新 LocalSend 广播指纹。 */
   async refreshAliasFingerprint(): Promise<void> {
-    const certFingerprint = await this.certs.fingerprint();
-    const fingerprint = certFingerprint.length > 0 ? certFingerprint : await DeviceIdentity.load(this.context);
+    const fingerprint = await this.certs.discoveryFingerprint(LocalSendServer.lastHttpsActive);
     this.localsend.setFingerprint(fingerprint);
   }
 
@@ -375,33 +449,45 @@ export class AppServices {
   }
 
   private async startQuickShareReceive(): Promise<void> {
-    if (this.gsQuickshareReady) {
-      return;
-    }
-    if (this.quickShareStartPromise !== undefined) {
+    const generation = this.receiveGeneration;
+    while (this.quickShareStartPromise !== undefined) {
       await this.quickShareStartPromise;
-      return;
+      if (generation !== this.receiveGeneration) { return; }
     }
-    const promise = this.doStartQuickShareReceive();
+    if (this.gsQuickshareReady) { return; }
+    const promise = this.doStartQuickShareReceive(generation);
     this.quickShareStartPromise = promise;
     try {
       await promise;
     } finally {
-      this.quickShareStartPromise = undefined;
+      if (this.quickShareStartPromise === promise) {
+        this.quickShareStartPromise = undefined;
+      }
     }
   }
 
-  private async doStartQuickShareReceive(): Promise<void> {
+  private async doStartQuickShareReceive(generation: number): Promise<void> {
     if (this.gsQuickshareReady) {
       return;
     }
     try {
       const facade = createGsFacade('quickshare', this.context);
       await facade.startReceive(GS_QUICKSHARE_PORT, this.buildQuickShareHooks(), '0.0.0.0');
+      if (generation !== this.receiveGeneration) {
+        facade.stopReceive();
+        return;
+      }
       this.gsQuickshare = facade;
       this.gsQuickshareReady = true;
+      this.quickShareReceiveErrorText = '';
       Lg.i('[QUICKSHARE] AppServices listen ok port=' + GS_QUICKSHARE_PORT + ' bind=0.0.0.0');
     } catch (error) {
+      if (generation !== this.receiveGeneration) { return; }
+      const detail: string = error instanceof Error ? error.message : JSON.stringify(error);
+      // 不再静默失败：端口被占用时 mDNS 仍会按 53318 通告，对端能“看见”却连不上，
+      // 这里把原因留给页面显示（QuickShare 页面 aboutToAppear 读取）。
+      this.quickShareReceiveErrorText = 'Quick Share 接收启动失败：端口 ' + GS_QUICKSHARE_PORT
+        + ' 可能已被其他服务占用（网页端传输应使用 23333）。' + detail;
       Lg.e('[QUICKSHARE] AppServices startReceive failed: ' + JSON.stringify(error));
     }
   }
@@ -435,25 +521,74 @@ export class AppServices {
           return ok;
         });
       },
-      onFileReceived: (file: IncomingFile): void => {
-        QuickShareTransferHistory.add(this.context, {
-          id: 'rcv-' + Date.now() + '-' + file.name,
+      onFileReceived: async (file: IncomingFile): Promise<void> => {
+        const taskId = this.qsReceiveTaskId;
+        const peer = this.lastPeerName;
+        const stagedPath: string = file.savedPath ?? '';
+        let resolved: IncomingFile = file;
+
+        // 先让动态照片链路决定归属，避免把动态照片的图片/视频半对拆成普通资产。
+        const dynamicSelf: IncomingFileLike = {
           name: file.name,
           size: file.size,
+          savedPath: stagedPath
+        };
+        const dynamicBatch: IncomingFileLike[] = this.qsReceiveFiles.map(
+          (item: IncomingFile): IncomingFileLike => ({
+            name: item.name,
+            size: item.size,
+            savedPath: item.savedPath ?? ''
+          })
+        );
+        try {
+          await DynamicPhotoService.settleReceivedFile(
+            this.context, dynamicSelf, dynamicBatch.concat([dynamicSelf]), 'quickshare:' + taskId);
+        } catch (error) {
+          Lg.w('[DYNAMIC] settle (quickshare) failed: '
+            + (error instanceof Error ? error.message : JSON.stringify(error)));
+        }
+
+        if (file.stagedForSave === true) {
+          try {
+            const processed = await GalleryAutoSaveService.processCompleted(
+              this.context, stagedPath, file.name, file.size, true, file.mime ?? '');
+            if (processed.finalPath.length > 0) {
+              resolved = {
+                name: file.name,
+                size: file.size,
+                savedPath: processed.finalPath,
+                mime: file.mime,
+                stagedForSave: true
+              };
+            }
+            Lg.i('[GALLERY] quickshare handled=' + processed.handled
+              + ' gallery=' + processed.savedToGallery
+              + ' name=' + file.name
+              + ' final=' + processed.finalPath
+              + ' error=' + processed.error);
+          } catch (error) {
+            Lg.w('[GALLERY] quickshare save failed: '
+              + (error instanceof Error ? error.message : JSON.stringify(error)));
+          }
+        }
+
+        QuickShareTransferHistory.add(this.context, {
+          id: 'rcv-' + Date.now() + '-' + resolved.name,
+          name: resolved.name,
+          size: resolved.size,
           direction: 'receive',
-          peer: this.lastPeerName,
+          peer: peer,
           completedAt: Date.now(),
-          savedPath: file.savedPath ?? ''
+          savedPath: resolved.savedPath ?? ''
         }).catch((): void => undefined);
         this.quickShareEvents.emit({
           kind: 'file',
-          file: file,
-          peer: this.lastPeerName
+          file: resolved,
+          peer: peer
         });
-        if (this.qsReceiveTaskId.length > 0) {
-          this.qsReceiveFiles = this.qsReceiveFiles.concat([file]);
-          this.transfer.addReceivedFile(this.qsReceiveTaskId, file);
-          this.maybeCompleteQuickShareReceive();
+        if (taskId.length > 0 && this.qsReceiveTaskId === taskId) {
+          this.qsReceiveFiles = this.qsReceiveFiles.concat([resolved]);
+          this.transfer.addReceivedFile(taskId, resolved);
         }
       },
       onProgress: (percent: number): void => {
@@ -468,7 +603,22 @@ export class AppServices {
           }
         }
       },
+      onSessionFailed: (key: string, reason: string): void => {
+        const task = this.transfer.getTask(this.qsReceiveTaskId);
+        if (task !== undefined && task.gateKey === key) {
+          this.qsReceiveTaskId = '';
+          this.qsReceiveFiles = [];
+          this.qsReceiveTotal = 0;
+          this.transfer.finishTask(task.id, false, reason);
+          this.quickShareEvents.emit({ kind: 'transport', detail: '接收失败：' + reason });
+        }
+      },
       onUpgradeAvailable: async (mediums: number[]): Promise<WifiDirectUpgradeCredentials | undefined> => {
+        // 「仅局域网」模式：明确拒绝升级，且**不建组**（建了不用只会留残组）。
+        if (SettingsStore.current().quickshareTransport === 'lan') {
+          Lg.i('[QUICKSHARE] onUpgradeAvailable declined: transport mode=lan');
+          return undefined;
+        }
         const creds: P2pGroupCredentials | undefined = await this.startQuickShareWlanDirect();
         if (creds === undefined || creds.goIpAddress.length === 0) {
           Lg.i('[QUICKSHARE] onUpgradeAvailable declined: P2P group not ready');
@@ -481,6 +631,12 @@ export class AppServices {
           gateway: creds.goIpAddress,
           frequency: creds.frequency
         };
+      },
+      // 介质变化（升级到 WLAN 直连成功/失败）——升级是静默的，透出到日志与页面状态栏。
+      onTransportChange: (change: GsTransportChange): void => {
+        Lg.i('[QUICKSHARE][P2P] transport=' + change.medium + ' upgraded=' + change.upgraded
+          + ' detail=' + change.detail);
+        this.quickShareEvents.emit({ kind: 'transport', detail: change.detail });
       }
     };
   }
@@ -497,6 +653,8 @@ export class AppServices {
     const files = this.qsReceiveFiles;
     this.qsReceiveTaskId = '';
     this.transfer.finishTask(taskId, true);
+    // 动态图片传输(Beta)：会话结束，给等待配对的动态图片最后一次机会。
+    TransferManager.settleDynamicBatch(this.context, files, 'quickshare:' + taskId);
     this.showQuickShareReceiveCompletedDialog(files);
   }
 
@@ -507,17 +665,18 @@ export class AppServices {
     }
     const count = files.length;
     const names = files.map((f: IncomingFile): string => f.name).join('、');
-    const message = count === 1
-      ? `已接收 1 个文件：${names}，已保存到应用目录。`
+    const message: Resource | string = count === 1
+      ? $r('app.string.quick_share_receive_done_one', names)
       : count > 1
-        ? `已接收 ${count} 个文件：${names}，已保存到应用目录。`
-        : '接收完成。';
+        ? $r('app.string.quick_share_receive_done_many', count, names)
+        : $r('app.string.quick_share_receive_done_empty');
     const buttons: promptAction.Button[] = [];
     if (count === 1) {
       buttons.push({ text: '打开', color: HwColor.primary });
     }
     buttons.push({ text: '确认', color: HwColor.primary });
     promptAction.showDialog({
+      systemMaterial: dialogSystemMaterial(),
       title: '接收完成',
       message: message,
       buttons: buttons
@@ -529,7 +688,7 @@ export class AppServices {
         if (first !== undefined && first.savedPath.length > 0) {
           this.openReceivedFile(first.savedPath);
         } else {
-          promptAction.showToast({ message: '文件路径为空', duration: 2000 });
+          promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '文件路径为空', duration: 2000 });
         }
       }
     }).catch((): void => {
@@ -547,22 +706,23 @@ export class AppServices {
         flags: 1,
         parameters: { 'ohos.aafwk.param.bundleName': 'com.cashmere.link' }
       }).catch((error: BusinessError): void => {
-        promptAction.showToast({ message: '无法打开：' + (error.message ?? ''), duration: 2000 });
+        promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开：' + (error.message ?? ''), duration: 2000 });
       });
     } catch (error) {
-      promptAction.showToast({ message: '无法打开文件', duration: 2000 });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开文件', duration: 2000 });
     }
   }
 
   /** 页面未打开时的 Quick Share 接收确认弹窗，避免在任意位置接收时静默落盘。 */
   private promptIncomingConfirmation(peerName: string, files: SessionFileMeta[], pin: string): Promise<boolean> {
     if (!PinDialogGuard.tryBegin()) {
-      return Promise.resolve(true);
+      return Promise.resolve(false);
     }
     const fileNames = files.map((file: SessionFileMeta): string => file.name).join('、');
     const pinPart = pin.length > 0 ? ' 双方 PIN：' + pin : '';
     const detail = fileNames.length > 0 ? '：' + fileNames : '';
     return promptAction.showDialog({
+      systemMaterial: dialogSystemMaterial(),
       title: 'Quick Share 接收请求',
       message: `「${peerName}」想发送 ${files.length} 个文件${detail}。${pinPart}\n是否接收？`,
       buttons: [

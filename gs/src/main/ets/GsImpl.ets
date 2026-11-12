@@ -33,6 +33,8 @@ class StreamReceiverAdapter implements ReceiverConnection {
     this.conn.onData(listener);
   }
 
+  onClose(listener: () => void): void { this.conn.onClose?.(listener); }
+
   close(): void {
     this.conn.close();
   }
@@ -85,32 +87,71 @@ export class GsFacadeImpl {
             || message.indexOf('EINPROGRESS') >= 0
             || message.indexOf('socket') >= 0
             || message.indexOf('close before connect') >= 0);
-        if (isConnectFailure && device.port > 0 && device.port !== GS_QUICKSHARE_PORT) {
-          console.warn('Quick Share advertised port ' + device.port + ' 无响应，仅作启发式再试探标准端口 '
-            + GS_QUICKSHARE_PORT + '（对 Android 官方 Quick Share 通常无效）：' + message);
-          const fallback: GsDevice = {
-            id: device.id,
-            name: device.name,
-            model: device.model,
-            protocol: device.protocol,
-            address: device.address,
-            port: GS_QUICKSHARE_PORT,
-            https: device.https,
-            fingerprint: device.fingerprint,
-            source: device.source,
-            supports5Ghz: device.supports5Ghz
-          };
-          await new QuickShareChannel().send(fallback, files, hooks, peerName);
-        } else {
+        if (!isConnectFailure) {
           const base: string = error instanceof Error ? error.message : message;
           throw new Error(base.indexOf('SYN 无应答') >= 0
             ? base + '。请确认对端处于「接收/可见」状态、两端在同一可路由网络，且无线 AP 未开启客户端隔离（设备间单播被拦）。'
             : base);
         }
+        const base: string = error instanceof Error ? error.message : message;
+        // 对照 A：同样的地址与端口，但**不绑定来源地址**。
+        // 绑定本机 IP 时，如果应用网络的出栈接口被容器/VPN（ancowlan0/chba0 之类）抢走，
+        // 源地址与出接口不匹配的包会被丢弃，表现就是「一个 SYN-ACK 都收不到」。这条重试专门
+        // 用来区分「对端没应答」和「我们自己的出栈被绑定搞坏」。
+        console.warn('Quick Share 连接失败（' + base + '）；对照 A：不绑定来源地址重试同一目标 '
+          + device.address + ':' + device.port);
+        try {
+          await new QuickShareChannel().send(device, files, GsFacadeImpl.withoutSourceAddress(hooks), peerName);
+          return;
+        } catch (retryError) {
+          const retryMessage: string = retryError instanceof Error ? retryError.message : JSON.stringify(retryError);
+          console.warn('Quick Share 不绑定来源地址仍失败：' + retryMessage);
+          const retryConnectFailure: boolean = retryMessage.indexOf('waiting for frame') < 0
+            && (retryMessage.indexOf('connect failed') >= 0
+              || retryMessage.indexOf('EINPROGRESS') >= 0
+              || retryMessage.indexOf('socket') >= 0
+              || retryMessage.indexOf('close before connect') >= 0);
+          // 对照 B：启发式再试探标准端口 53318（对 Android 官方 Quick Share 通常无效）。
+          if (retryConnectFailure && device.port > 0 && device.port !== GS_QUICKSHARE_PORT) {
+            console.warn('Quick Share advertised port ' + device.port + ' 无响应，仅作启发式再试探标准端口 '
+              + GS_QUICKSHARE_PORT + '（对 Android 官方 Quick Share 通常无效）');
+            const fallback: GsDevice = {
+              id: device.id,
+              name: device.name,
+              model: device.model,
+              protocol: device.protocol,
+              address: device.address,
+              port: GS_QUICKSHARE_PORT,
+              https: device.https,
+              fingerprint: device.fingerprint,
+              source: device.source,
+              supports5Ghz: device.supports5Ghz
+            };
+            await new QuickShareChannel().send(fallback, files, GsFacadeImpl.withoutSourceAddress(hooks), peerName);
+            return;
+          }
+          throw new Error(retryMessage.indexOf('SYN 无应答') >= 0
+            ? retryMessage + '。已尝试「绑定/不绑定本机 IP」两种出栈方式。请确认对端处于「接收/可见」状态、'
+              + '两端在同一可路由网络，且对端未被 AP/防火墙拦截设备间 TCP。'
+            : retryMessage);
+        }
       }
     } else {
       await new NearShareProtocol().send(device, files, hooks, peerName);
     }
+  }
+
+  /** 复制一份发送钩子，但清掉来源地址绑定（对照实验用，见 send 里的对照 A）。 */
+  private static withoutSourceAddress(hooks: GsSendHooks): GsSendHooks {
+    return {
+      onPin: hooks.onPin,
+      onProgress: hooks.onProgress,
+      localEndpointId: hooks.localEndpointId,
+      sourceAddress: undefined,
+      forceWifiDirect: hooks.forceWifiDirect,
+      pcPeer: hooks.pcPeer,
+      onWifiDirectTransport: hooks.onWifiDirectTransport
+    };
   }
 
   /**
@@ -150,7 +191,10 @@ export class GsFacadeImpl {
       throw new Error('runReceiveStream 仅支持 quickshare');
     }
     const adapter: ReceiverConnection = new StreamReceiverAdapter(conn);
-    await new QuickShareReceiver(this.context).run(adapter, hooks);
+    // BLE 引导会话：带宽极低，接收端在这里**主动**发起 Wi-Fi Direct 升级
+    // （官方角色模型里升级由服务端发起，见 docs/WIFI_DIRECT.md §2.4）。
+    const receiver = this.quickshareReceiver ?? new QuickShareReceiver(this.context);
+    await receiver.run(adapter, hooks, undefined, true);
   }
 
   async selfTest(): Promise<string> {

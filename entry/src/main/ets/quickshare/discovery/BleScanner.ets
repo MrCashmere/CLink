@@ -1,3 +1,5 @@
+// 羊绒互传修改：系统扫描使用独立租约，避免其它协议启停时移除本协议回调。
+import { SharedBleScanLease } from '../../common/SharedBleScan';
 import { LogCapture as Lg } from '../../common/LogCapture';
 import ble from '@ohos.bluetooth.ble';
 import { QuickShareDiscoveredDevice } from '../model/DiscoveredDevice';
@@ -12,6 +14,7 @@ const FAST_INIT_SIGNATURE: number[] = [0xfc, 0x12, 0x8e];
 const FAST_INIT_COOLDOWN_MS = 30000;
 
 export class QuickShareBleScanner {
+  private scanLease: SharedBleScanLease = new SharedBleScanLease();
   private readonly parser: QuickShareAdvertisementParser;
   private readonly listener: QuickShareDeviceListener;
   private readonly fastInitiationListener?: QuickShareFastInitiationListener;
@@ -28,7 +31,7 @@ export class QuickShareBleScanner {
     if (this.scanning) { return; }
     this.scanning = true;
     Lg.i('[QUICKSHARE] BLE scan start (FEF3 serviceData prefix 0x23; filter FE2C/FEF3 in JS)');
-    ble.on('BLEDeviceFind', (results: Array<ble.ScanResult>): void => {
+    this.scanLease.on('BLEDeviceFind', (results: Array<ble.ScanResult>): void => {
       results.forEach((result: ble.ScanResult): void => {
         const keys: string = result.serviceDataMap === undefined
           ? '<none>'
@@ -81,7 +84,7 @@ export class QuickShareBleScanner {
       serviceDataMask: ByteUtils.toArrayBuffer(new Uint8Array([0xff]))
     }];
     try {
-      ble.startBLEScan(filter, {
+      this.scanLease.start(filter, {
         interval: 500,
         dutyMode: ble.ScanDuty.SCAN_MODE_LOW_LATENCY,
         matchMode: ble.MatchMode.MATCH_MODE_AGGRESSIVE
@@ -92,7 +95,7 @@ export class QuickShareBleScanner {
       // a GAP service UUID (e.g. our own advertising).
       Lg.w('[QUICKSHARE] BLE scan (FEF3 serviceData prefix) failed, fallback to FEF3 serviceUuid: '
         + JSON.stringify(scanError));
-      ble.startBLEScan([
+      this.scanLease.start([
         { serviceUuid: '0000fef3-0000-1000-8000-00805f9b34fb' }
       ], {
         interval: 500,
@@ -106,7 +109,7 @@ export class QuickShareBleScanner {
     if (!this.scanning) { return; }
     this.scanning = false;
     try {
-      ble.stopBLEScan();
+      this.scanLease.stop();
     } catch (error) {
       // Teardown races the BLE service: by the time aboutToDisappear runs, the
       // scanner id can already be invalid (IsValidScannerId transact fails) or the
@@ -115,7 +118,7 @@ export class QuickShareBleScanner {
       Lg.w('[QUICKSHARE] BLE stopBLEScan failed: ' + JSON.stringify(error));
     }
     try {
-      ble.off('BLEDeviceFind');
+      this.scanLease.off('BLEDeviceFind');
     } catch (error) {
       Lg.w('[QUICKSHARE] BLE off BLEDeviceFind failed: ' + JSON.stringify(error));
     }

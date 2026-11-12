@@ -29,5 +29,6 @@ export type {
   GsDeps,
   GsStreamConnection,
   GsCdpDevice,
-  WifiDirectUpgradeCredentials
+  WifiDirectUpgradeCredentials,
+  GsTransportChange
 } from './src/main/ets/model/GsTypes';

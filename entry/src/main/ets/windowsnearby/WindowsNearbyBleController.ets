@@ -1,3 +1,5 @@
+// 羊绒互传修改：系统扫描使用独立租约，避免其它协议启停时移除本协议回调。
+import { SharedBleScanLease } from '../common/SharedBleScan';
 import { LogCapture as Lg } from '../common/LogCapture';
 import ble from '@ohos.bluetooth.ble';
 import access from '@ohos.bluetooth.access';
@@ -34,8 +36,17 @@ const ADVERTISE_REASSERT_MIN_GAP_MS = 10000;
 const ADVERTISE_REASSERT_INTERVAL_MS = 30000;
 
 export class WindowsNearbyBleController {
+  private scanLease: SharedBleScanLease = new SharedBleScanLease();
   private readonly listener: WindowsNearbyDeviceListener;
   private active = false;
+  private watchingBluetooth: boolean = false;
+  private readonly bluetoothStateListener: (state: access.BluetoothState) => void = (state: access.BluetoothState): void => {
+    if (!this.active) { return; }
+    if (state === access.BluetoothState.STATE_ON || state === access.BluetoothState.STATE_BLE_ON) {
+      if (!this.scanLease.active) { this.startScan(); }
+      this.reassertAdvertisement();
+    }
+  };
   private macHex = '000000000000';
   private readonly peers: Map<string, WindowsNearbyPeer> = new Map();
   private advertisingActive = false;
@@ -49,6 +60,12 @@ export class WindowsNearbyBleController {
   start(): void {
     if (this.active) { return; }
     this.active = true;
+    if (!this.watchingBluetooth) {
+      try {
+        access.on('stateChange', this.bluetoothStateListener);
+        this.watchingBluetooth = true;
+      } catch (error) { Lg.w(LOG_TAG + ': watch Bluetooth failed: ' + String(error)); }
+    }
     this.peers.clear();
     this.startScan();
     this.startAdvertisement();
@@ -59,6 +76,11 @@ export class WindowsNearbyBleController {
   stop(): void {
     if (!this.active) { return; }
     this.active = false;
+    if (this.watchingBluetooth) {
+      try { access.off('stateChange', this.bluetoothStateListener); }
+      catch (error) { Lg.w(LOG_TAG + ': unwatch Bluetooth failed: ' + String(error)); }
+      this.watchingBluetooth = false;
+    }
     this.peers.clear();
     this.stopAdvertiseReassertTimer();
     this.stopScan();
@@ -86,7 +108,8 @@ export class WindowsNearbyBleController {
 
   private startScan(): void {
     try {
-      ble.on('BLEDeviceFind', (results: Array<ble.ScanResult>): void => {
+      this.scanLease.off('BLEDeviceFind');
+      this.scanLease.on('BLEDeviceFind', (results: Array<ble.ScanResult>): void => {
         results.forEach((result: ble.ScanResult): void => this.parseScanResult(result));
       });
       const scanOptions: ble.ScanOptions = {
@@ -95,20 +118,20 @@ export class WindowsNearbyBleController {
         matchMode: ble.MatchMode.MATCH_MODE_AGGRESSIVE
       };
       try {
-        ble.startBLEScan([{ manufactureId: GS_CDP_MANUFACTURER_ID }, { serviceUuid: MS_CDP_SERVICE_UUID }], scanOptions);
+        this.scanLease.start([{ manufactureId: GS_CDP_MANUFACTURER_ID }, { serviceUuid: MS_CDP_SERVICE_UUID }], scanOptions);
         Lg.i(LOG_TAG + ': scan started (microsoft 0x0006 + FDEE filter)');
       } catch (error) {
         const filterFailure = error as BusinessError;
         Lg.w(LOG_TAG + ': combined filter failed code=' + filterFailure.code
           + ', message=' + filterFailure.message + ', fallback to FDEE serviceUuid filter');
         try {
-          ble.startBLEScan([{ serviceUuid: MS_CDP_SERVICE_UUID }], scanOptions);
+          this.scanLease.start([{ serviceUuid: MS_CDP_SERVICE_UUID }], scanOptions);
           Lg.i(LOG_TAG + ': scan started (FDEE serviceUuid filter)');
         } catch (error2) {
           const fdeeFailure = error2 as BusinessError;
           Lg.w(LOG_TAG + ': FDEE filter also failed code=' + fdeeFailure.code
             + ', message=' + fdeeFailure.message + ', fallback to unfiltered scan');
-          ble.startBLEScan([], scanOptions);
+          this.scanLease.start([], scanOptions);
           Lg.i(LOG_TAG + ': scan started (unfiltered)');
         }
       }
@@ -120,13 +143,13 @@ export class WindowsNearbyBleController {
 
   private stopScan(): void {
     try {
-      ble.stopBLEScan();
+      this.scanLease.stop();
     } catch (error) {
       const failure = error as BusinessError;
       Lg.w(LOG_TAG + ': scan stop failed code=' + failure.code + ', message=' + failure.message);
     }
     try {
-      ble.off('BLEDeviceFind');
+      this.scanLease.off('BLEDeviceFind');
     } catch (error) {
       Lg.w(LOG_TAG + ': BLE callback unregister failed: ' + JSON.stringify(error));
     }
@@ -353,6 +376,7 @@ export class WindowsNearbyBleController {
     }
     this.advertiseTimer = setInterval((): void => {
       if (this.active) {
+        if (!this.scanLease.active) { this.startScan(); }
         this.startAdvertisement();
       }
     }, ADVERTISE_REASSERT_INTERVAL_MS);

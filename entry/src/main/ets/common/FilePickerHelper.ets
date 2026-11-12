@@ -94,8 +94,28 @@ export class FilePickerHelper {
     }
   }
 
-  /** 异步取文件大小：先直接 stat URI，失败再回退到 fileUri 解出的真实路径。 */
+  /**
+   * 异步取文件大小。
+   *
+   * 顺序很关键：**先「打开后 fstat」**，再退回 `fs.stat(uri)`。选择器返回的 URI 上 `fs.stat`
+   * 有时给出与实际可读字节数不一致的 size（实测 HEIC 差了几 KB、另一个文件元数据 28 MB 而
+   * 实际只能读到 2.5 MB）—— 这个 size 会被网页端下载当作 Content-Length，一旦不符，
+   * 浏览器就会一直等剩下的数据、最后报「下载失败」。fstat 拿到的是打开后真实的文件大小。
+   */
   static async sizeOf(uri: string): Promise<number> {
+    try {
+      const file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+      try {
+        const stat = fs.statSync(file.fd);
+        if (stat.size > 0) {
+          return stat.size;
+        }
+      } finally {
+        fs.closeSync(file);
+      }
+    } catch (error) {
+      // fall through
+    }
     try {
       return (await fs.stat(uri)).size;
     } catch (error) {

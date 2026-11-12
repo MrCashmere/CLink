@@ -9,27 +9,40 @@ import { DeviceEndpoint, IncomingFile, OutgoingFile, SessionFileMeta } from '../
 import { DeviceList } from '../view/DeviceList';
 import { IconCircleButton } from '../components/IconCircleButton';
 import { AppBackground } from '../components/AppBackground';
-import { HwColor, HwRadius, HwSpace, hwTextPrimary, hwTextSecondary, hwPrimary, hwPrimaryButton, hwGlassSurface, hwGlassBorder } from '../utils/DesignTokens';
-import { isApi26OrAbove, immersiveMaterialModifier, legacyMaterialModifier } from '../utils/SystemMaterial';
+import { HwColor, HwRadius, HwSpace, hwTextPrimary, hwTextSecondary, hwPrimary, hwPrimaryButton, hwGlassBorder, reloadAppTheme, resolvePageBackground, onAccentColor, topBarGlassColor, resolvePrimaryColor, resolvePrimaryButtonColor } from '../utils/DesignTokens';
+import { cardGlassEffect, toastSystemMaterial, dialogSystemMaterial, cardGlassBorderColor, cardGlassShadow } from '../utils/SystemMaterial';
 import { QuickShareBrowser, QuickSharePageEndpoint } from '../quickshare/controller/QuickShareBrowser';
-import { createGsFacade, GsFacade, GsSendHooks, GS_QUICKSHARE_PORT } from '../protocol/gs/GsFacade';
+import { createGsFacade, GsFacade, GsSendHooks, GS_QUICKSHARE_PORT, GsTransportChange } from '../protocol/gs/GsFacade';
 import { getLocalIpv4 } from '../common/NetAddress';
 import { AppServices } from '../common/AppServices';
 import { QuickShareServiceEvent } from '../quickshare/utils/EventEmitter';
 import { QuickShareTransferHistory } from '../quickshare/storage/TransferHistory';
 import { SettingsStore } from '../common/SettingsStore';
 import { sharedFilesFromParams } from '../common/ShareHandleUtil';
+import { DynamicPhotoService } from '../common/DynamicPhotoService';
 import { FilePickerHelper } from '../common/FilePickerHelper';
 import { NearbyBleSocketClient } from '../quickshare/ble/NearbyBleSocketClient';
 import { NearbyP2pDirect } from '../quickshare/ble/NearbyP2pDirect';
+import { LanReachability, TransportDecision } from '../quickshare/utils/LanReachability';
+import { QuickShareTransportMode } from '../quickshare/model/TransportPolicy';
 import { GsStreamConnection } from '../protocol/gs/GsFacade';
+import { CardSurface } from '../components/CardSurface';
+import { AccentColorSentinel } from '../components/MaterialCard';
 
 @Entry
 @Component
 struct QuickSharePage {
+  /** 主题色变化时触发重建，让 HwColor.primary 与选中态取到新色值 */
+  @StorageProp('accentColor') @Watch('onAccentColorChanged') accentColor: string = '';
+  /** 页面底色（由 applyAppTheme 发布）。直接读 HwColor.background 登记不上依赖 */
+  @StorageProp('pageBackground') pageBackground: string = '';
   @StorageProp('statusBarHeight') statusBarHeight: number = 0;
   @StorageProp('isDarkMode') isDarkMode: boolean = false;
   @StorageLink('immersiveLightEnabled') immersiveLightEnabled: boolean = true;
+  @StorageLink('beautifulCards') beautifulCards: boolean = false;
+  @StorageLink('classicCards') classicCards: boolean = false;
+  @StorageLink('cardShadowBorder') cardShadowBorder: boolean = true;
+  @StorageLink('experimentalCards') experimentalCards: boolean = false;
   @StorageLink('fontMode') fontMode: string = 'system';
   @StorageLink('fontFamilyEn') fontFamilyEn: string = 'system';
   @StorageLink('fontFamilyZh') fontFamilyZh: string = 'system';
@@ -93,12 +106,22 @@ struct QuickSharePage {
     services.startReceive().then((): void => {
       this.browser?.start();
       this.syncEndpoints();
-      if (SettingsStore.current().quickshareWlanDirect) {
+      // 接收端由 AppServices 常驻启动：若 53318 被别的服务占用（历史上曾被「局域网网页
+      // 传输」的明文 HTTP 监听抢占），这里给出可见提示，避免“能发现却收不到文件”的静默失败。
+      const receiveFault: string = services.quickShareReceiveFault();
+      if (receiveFault.length > 0) {
+        this.statusText = receiveFault;
+        promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: receiveFault, duration: 4000 });
+      }
+      const transportMode: QuickShareTransportMode = SettingsStore.current().quickshareTransport ?? 'auto';
+      if (transportMode === 'direct') {
         this.statusText = 'WLAN 直连优先：仅 BLE 发现 + Wi-Fi Direct 传输';
+      } else if (transportMode === 'lan') {
+        this.statusText = '仅局域网模式：不建立 WLAN 直连';
       }
       // 接收（BLE GATT socket）常开：让 stock Android 在无 LAN 可达时能 bootstrap。
       services.startQuickShareBle().catch((): void => undefined);
-      if (SettingsStore.current().quickshareWlanDirect) {
+      if (transportMode === 'direct') {
         services.startQuickShareWlanDirect().then((credentials) => {
           if (credentials !== undefined && credentials.goIpAddress.length > 0) {
             this.statusText = 'WLAN 直连组已就绪 ' + credentials.goIpAddress + ':' + GS_QUICKSHARE_PORT;
@@ -133,6 +156,7 @@ struct QuickSharePage {
 
   private promptStabilityHint(): void {
     promptAction.showDialog({
+      systemMaterial: dialogSystemMaterial(),
       title: 'Quick Share 提示',
       message: '目前 Quick Share 可用但不稳定，若您出现点击传输后报错，请参考「设置 -> 关于 -> 解决方案」。',
       buttons: [
@@ -156,8 +180,20 @@ struct QuickSharePage {
     this.facade = undefined;
   }
 
+  /** 主题色变了：HwColor 是模块级对象，改属性不会触发刷新，靠这里重建页面 */
+  onAccentColorChanged(): void {
+    reloadAppTheme();
+  }
+
+  /** 当前主题色。读 accentColor 建立依赖；直接写 HwColor.primary 切色后不会重新求值 */
+  private accentOrPrimary(): string {
+    return this.accentColor.length > 0 ? this.accentColor : HwColor.primary;
+  }
+
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
+      // 主题色依赖：切色时让整页重新求值（零尺寸，不参与布局）
+      AccentColorSentinel()
       AppBackground()
       Column() {
         Scroll() {
@@ -172,7 +208,7 @@ struct QuickSharePage {
             DeviceList({
               devices: this.devices,
               onSelect: (device: DeviceEndpoint): void => {
-                this.sendOrPick(device).catch((error: Error): void => promptAction.showToast({ message: error.message }));
+                this.sendOrPick(device).catch((error: Error): void => promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: error.message }));
               }
             })
             this.manualAddCard()
@@ -198,103 +234,117 @@ struct QuickSharePage {
       .backgroundColor(Color.Transparent)
 
       Row() {
-        IconCircleButton({ symbol: $r('sys.symbol.chevron_left'), buttonSize: 40, iconSize: 20, onAction: (): void => router.back() })
+        IconCircleButton({ symbol: $r('sys.symbol.chevron_left'), glass: true, buttonSize: 40, iconSize: 20, onAction: (): void => router.back() })
         Text('Quick Share').fontSize(20).fontWeight(FontWeight.Bold).fontFamily(this.appFontFamily('Quick Share')).fontColor(hwTextPrimary(this.isDarkMode)).margin({ left: HwSpace.md })
         Blank()
       }
       .width('100%')
       .height(56 + this.statusBarHeight)
       .padding({ left: 16, right: 16, top: this.statusBarHeight })
-      .backgroundEffect({ radius: 12, color: '#66FFFFFF' })
+      .backgroundEffect({ radius: 12, color: topBarGlassColor(this.isDarkMode) })
     }
     .width('100%')
     .height('100%')
-    .backgroundColor(this.isDarkMode ? HwColor.backgroundDark : HwColor.background)
+    .backgroundColor(resolvePageBackground(this.isDarkMode, this.pageBackground))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
   @Builder
   statusCard() {
-    Column({ space: 4 }) {
-      Text('状态').fontSize(12).fontFamily(this.appFontFamily('状态')).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
-      Text(this.statusText).fontSize(14).fontFamily(this.appFontFamily(this.statusText)).fontWeight(this.appFontWeight()).fontColor(hwTextPrimary(this.isDarkMode))
+    CardSurface({ radius: HwRadius.card }) {
+      Column({ space: 4 }) {
+        Text('状态').fontSize(12).fontFamily(this.appFontFamily('状态')).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
+        Text(this.statusText).fontSize(14).fontFamily(this.appFontFamily(this.statusText)).fontWeight(this.appFontWeight()).fontColor(hwTextPrimary(this.isDarkMode))
+      }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
   }
 
   @Builder
   selectFileCard() {
-    Row({ space: 12 }) {
-      Text('选择文件').fontSize(16).fontWeight(FontWeight.Medium).fontFamily(this.appFontFamily('选择文件')).fontColor(hwPrimary(this.isDarkMode)).layoutWeight(1)
-      Text(this.selectedFiles.length > 0 ? '已选择 ' + this.selectedFiles.length + ' 个文件' : '从系统中选择要发送的文件').fontSize(12).fontFamily(this.appFontFamily('从系统中选择要发送的文件')).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
-      SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(16).fontColor([hwTextSecondary(this.isDarkMode)])
+    CardSurface({ radius: HwRadius.card }) {
+      Row({ space: 12 }) {
+        Text('选择文件').fontSize(16).fontWeight(FontWeight.Medium).fontFamily(this.appFontFamily('选择文件')).fontColor(resolvePrimaryColor(this.isDarkMode, this.accentOrPrimary())).layoutWeight(1)
+        Text(this.selectedFiles.length > 0 ? '已选择 ' + this.selectedFiles.length + ' 个文件' : '从系统中选择要发送的文件').fontSize(12).fontFamily(this.appFontFamily('从系统中选择要发送的文件')).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
+        SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(16).fontColor([hwTextSecondary(this.isDarkMode)])
+      }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
+      .onClick(() => this.pickFiles())
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
-    .onClick(() => this.pickFiles())
   }
 
   @Builder
   manualAddCard() {
-    Column({ space: 10 }) {
-      Row({ space: 10 }) {
-        TextInput({ placeholder: '对端 IP (如 192.168.0.113)', text: this.manualAddress })
-          .layoutWeight(1).height(40)
-          .onChange((v: string): void => { this.manualAddress = v; });
-        TextInput({ placeholder: '动态端口', text: this.manualPortText })
-          .width(90).height(40)
-          .onChange((v: string): void => { this.manualPortText = v; });
-        Button('添加').height(40).fontSize(13).backgroundColor(hwPrimaryButton(this.isDarkMode))
-          .fontColor(Color.White).onClick((): void => this.addManualDevice());
-      }.width('100%')
-      Text('手动添加对端（绕开发现，直接指定地址）。对端端口为动态分配非固定，请以对端实际广播端口为准').fontSize(12).fontFamily(this.appFontFamily('手动添加对端（绕开发现，直接指定地址）。对端端口为动态分配非固定，请以对端实际广播端口为准')).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode)).width('100%')
+    CardSurface({ radius: HwRadius.card }) {
+      Column({ space: 10 }) {
+        Row({ space: 10 }) {
+          TextInput({ placeholder: '对端 IP (如 192.168.0.113)', text: this.manualAddress })
+            .caretColor(this.accentOrPrimary())
+            .layoutWeight(1).height(40)
+            .onChange((v: string): void => { this.manualAddress = v; });
+          TextInput({ placeholder: '动态端口', text: this.manualPortText })
+            .caretColor(this.accentOrPrimary())
+            .width(90).height(40)
+            .onChange((v: string): void => { this.manualPortText = v; });
+          Button('添加').height(40).fontSize(13).backgroundColor(resolvePrimaryButtonColor(this.isDarkMode, this.accentOrPrimary()))
+            .fontColor(onAccentColor(this.accentOrPrimary())).onClick((): void => this.addManualDevice());
+        }.width('100%')
+        Text('手动添加对端（绕开发现，直接指定地址）。对端端口为动态分配非固定，请以对端实际广播端口为准').fontSize(12).fontFamily(this.appFontFamily('手动添加对端（绕开发现，直接指定地址）。对端端口为动态分配非固定，请以对端实际广播端口为准')).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode)).width('100%')
+      }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
   }
 
   @Builder
   receivedFilesCard() {
-    Column({ space: 6 }) {
-      Text('已接收 ' + this.receivedFiles.length + ' 个文件').fontSize(14).fontWeight(FontWeight.Medium).fontFamily(this.appFontFamily('已接收 个文件')).fontColor(hwTextPrimary(this.isDarkMode))
-      ForEach(this.receivedFiles, (file: IncomingFile): void => {
-        Column({ space: 4 }) {
-          Row({ space: 8 }) {
-            Text(file.name).layoutWeight(1).fontSize(13).fontFamily(this.appFontFamily(file.name)).fontWeight(this.appFontWeight()).fontColor(hwTextPrimary(this.isDarkMode))
-              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-            Text(this.fileSizeText(file.size)).fontSize(12).fontFamily(this.appFontFamily(this.fileSizeText(file.size))).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
-            Button('打开', { type: ButtonType.Capsule }).height(26).fontSize(12).fontFamily(this.appFontFamily('打开'))
-              .backgroundColor(hwPrimaryButton(this.isDarkMode)).fontColor(Color.White)
-              .onClick(() => this.openFile(file))
+    CardSurface({ radius: HwRadius.card }) {
+      Column({ space: 6 }) {
+        Text('已接收 ' + this.receivedFiles.length + ' 个文件').fontSize(14).fontWeight(FontWeight.Medium).fontFamily(this.appFontFamily('已接收 个文件')).fontColor(hwTextPrimary(this.isDarkMode))
+        ForEach(this.receivedFiles, (file: IncomingFile): void => {
+          Column({ space: 4 }) {
+            Row({ space: 8 }) {
+              Text(file.name).layoutWeight(1).fontSize(13).fontFamily(this.appFontFamily(file.name)).fontWeight(this.appFontWeight()).fontColor(hwTextPrimary(this.isDarkMode))
+                .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text(this.fileSizeText(file.size)).fontSize(12).fontFamily(this.appFontFamily(this.fileSizeText(file.size))).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
+              Button('打开', { type: ButtonType.Capsule }).height(26).fontSize(12).fontFamily(this.appFontFamily('打开'))
+                .backgroundColor(resolvePrimaryButtonColor(this.isDarkMode, this.accentOrPrimary())).fontColor(onAccentColor(this.accentOrPrimary()))
+                .onClick(() => this.openFile(file))
+            }.width('100%')
+            Text(file.savedPath).fontSize(11).fontFamily(this.appFontFamily(file.savedPath)).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
+              .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
           }.width('100%')
-          Text(file.savedPath).fontSize(11).fontFamily(this.appFontFamily(file.savedPath)).fontWeight(this.appFontWeight()).fontColor(hwTextSecondary(this.isDarkMode))
-            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
-        }.width('100%')
-      }, (file: IncomingFile): string => file.savedPath + ':' + file.name)
+        }, (file: IncomingFile): string => file.savedPath + ':' + file.name + ':' + this.accentColor)
+      }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
   }
 
   private onQuickShareEvent(event: QuickShareServiceEvent): void {
@@ -311,6 +361,9 @@ struct QuickSharePage {
       if (pct >= 100) {
         this.statusText = '接收完成';
       }
+    } else if (event.kind === 'transport') {
+      // 升级到 WLAN 直连是静默的：把结果透出到状态栏（detail 由协议层给出）。
+      this.statusText = event.detail ?? '';
     }
   }
 
@@ -466,7 +519,7 @@ struct QuickSharePage {
   private addManualDevice(): void {
     const ip = this.manualAddress.trim();
     if (this.isIpv4(ip) === false) {
-      promptAction.showToast({ message: '请输入合法 IPv4 地址' });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '请输入合法 IPv4 地址' });
       return;
     }
     const parsed = Number(this.manualPortText.trim());
@@ -506,7 +559,7 @@ struct QuickSharePage {
   }
 
   private pickFiles(): void {
-    this.pickFilesNow().catch((error: BusinessError): void => promptAction.showToast({ message: '选择文件失败：' + error.message }));
+    this.pickFilesNow().catch((error: BusinessError): void => promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '选择文件失败：' + error.message }));
   }
 
   private pickFilesNow(): Promise<OutgoingFile[]> {
@@ -544,9 +597,23 @@ struct QuickSharePage {
     if (this.facade === undefined) {
       throw new Error('Quick Share 会话尚未就绪');
     }
+    const ctx = getContext(this) as common.UIAbilityContext;
+    // 动态图片传输(Beta)：按对端品牌封装（iPhone/iPad/Mac 发 Apple 实况照片，Android 各家发标准动态照片）。
+    const outgoing: OutgoingFile[] = await DynamicPhotoService.prepareOutgoing(ctx, this.selectedFiles,
+      DynamicPhotoService.resolveFormatFor(device));
     // 每次发送前都跑一次回环自测并打印结果，方便判定是「socket.connect 本机就不稳」
     // 还是「对端不可达/网络隔离」。
     this.selfTcpTest().catch((): void => undefined);
+    // 介质决策：三态设置（auto 探测对端可达性 / lan 只走局域网 / direct 优先直连）。
+    // 依据与失败链见 docs/WIFI_DIRECT.md §5.4。
+    const mode: QuickShareTransportMode = SettingsStore.current().quickshareTransport ?? 'auto';
+    const peerKey: string = device.fingerprint.length > 0 ? device.fingerprint : device.id;
+    const peerIp: string = device.source === 'ble' ? '' : (device.address ?? '');
+    const decision: TransportDecision =
+      await LanReachability.choose(mode, peerKey, peerIp, device.port ?? 0);
+    Lg.i('[QUICKSHARE] transport=' + decision.choice + ' mode=' + mode + ' reason=' + decision.reason
+      + ' peer=' + device.name);
+    const upgradeWanted: boolean = decision.choice === 'ble-p2p';
     const hooks: GsSendHooks = {
       onPin: (pin: string): Promise<boolean> => this.confirmPin(pin),
       onProgress: (percent: number): void => {
@@ -554,18 +621,21 @@ struct QuickSharePage {
       },
         localEndpointId: this.browser?.localEndpointIdValue(),
         sourceAddress: this.localIp.length > 0 ? this.localIp : undefined,
-        forceWifiDirect: SettingsStore.current().quickshareWlanDirect,
+        forceWifiDirect: upgradeWanted,
         pcPeer: device.deviceType === 3,
-        onWifiDirectTransport: (creds): Promise<GsStreamConnection | undefined> => {
+        onWifiDirectTransport: mode === 'lan' ? undefined : (creds): Promise<GsStreamConnection | undefined> => {
           return new NearbyP2pDirect().connectAsClient(creds);
+        },
+        // 升级成功/失败都透出到状态栏（发送侧是静默迁移，用户否则看不出差别）。
+        onTransportChange: (change: GsTransportChange): void => {
+          this.statusText = change.detail;
+          Lg.i('[QUICKSHARE][P2P] transport=' + change.medium + ' upgraded=' + change.upgraded);
         }
     };
     // 优先使用 BLE：按优先级选择
     //  1) 对端条目本身就是 BLE 扫描发现 -> 用它的广告 MAC（承载 Weave socket）
     //  2) 同一 endpointId 当前有 BLE 广告 -> 用扫描到的广告 MAC（即使列表里因
-    //     mDNS 优先级被顶掉，也以此为准，避免误连“接收时缓存的客户端 MAC”）
-    //  3) 最后才回退到接收会话缓存的对端 MAC（该 MAC 是对方作为发起方/中心
-    //     的地址，往往不暴露 socket 服务，仅作兜底）
+    //     mDNS 优先级被顶掉，也以此为准）
     let bleMac: string = '';
     if (device.source === 'ble') {
       bleMac = device.address ?? '';
@@ -573,30 +643,44 @@ struct QuickSharePage {
     if (bleMac.length === 0 && this.browser !== undefined) {
       bleMac = this.browser.bleAddressFor(device.fingerprint);
     }
-    if (bleMac.length === 0) {
-      bleMac = this.services?.lastPeerBleMacValue() ?? '';
-    }
-    if (bleMac.length > 0) {
+    // BLE 引导的两种情况：① 决定升级（直连/自动判定不可达）；② 完全没发现到局域网端点
+    // （此时「仅局域网」模式也允许 BLE 兜底传输，只是不请求升级）。
+    const useBleBootstrap: boolean = bleMac.length > 0 && (upgradeWanted || peerIp.length === 0);
+    if (useBleBootstrap) {
+      Lg.i('[QUICKSHARE] send via=ble mac=' + bleMac + ' peer=' + device.name
+        + ' (bootstrap, upgrade=' + upgradeWanted + ')');
       const bleClient: NearbyBleSocketClient = new NearbyBleSocketClient();
       const conn: GsStreamConnection = await bleClient.connect(bleMac);
       try {
-        await this.facade.sendStream(conn, this.selectedFiles, hooks);
+        await this.facade.sendStream(conn, outgoing, hooks);
       } finally {
         conn.close();
       }
     } else {
-      await this.facade.send(device, this.selectedFiles, hooks);
+      // 记录实际拨号的目标与源地址（applog 里以前没有这条，只能靠 hilog 且很快被刷掉）。
+      Lg.i('[QUICKSHARE] send via=tcp target=' + device.address + ':' + device.port
+        + ' source=' + (this.localIp.length > 0 ? this.localIp : '0.0.0.0') + ' peer=' + device.name
+        + ' sourceKind=' + device.source);
+      try {
+        await this.facade.send(device, outgoing, hooks);
+      } catch (error) {
+        Lg.e('[QUICKSHARE] send failed target=' + device.address + ':' + device.port
+          + ' peer=' + device.name + ': ' + (error as Error).message);
+        throw (error as Error);
+      }
     }
-    const ctx = getContext(this) as common.UIAbilityContext;
-    for (const f of this.selectedFiles) {
+    for (const f of outgoing) {
       QuickShareTransferHistory.add(ctx, { id: 'snd-' + Date.now() + '-' + f.name, name: f.name, size: f.size, direction: 'send', peer: device.name, completedAt: Date.now(), savedPath: '' }).catch((): void => undefined);
     }
+    const original = this.selectedFiles;
     this.selectedFiles = [];
-    promptAction.showToast({ message: 'Quick Share 传输已完成' });
+    DynamicPhotoService.cleanupOutgoing(original, outgoing);
+    promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: 'Quick Share 传输已完成' });
   }
 
   private confirmPin(pin: string): Promise<boolean> {
     return promptAction.showDialog({
+      systemMaterial: dialogSystemMaterial(),
       title: 'Quick Share 发送确认',
       message: `正在发送给对端设备。请确认双方设备显示的 PIN 均为 ${pin}，确认后开始传输。`,
       buttons: [
@@ -608,6 +692,7 @@ struct QuickSharePage {
 
   private onIncomingSession(peerName: string, files: SessionFileMeta[], pin: string): Promise<boolean> {
     return promptAction.showDialog({
+      systemMaterial: dialogSystemMaterial(),
       title: 'Quick Share 接收请求',
       message: `「${peerName}」想发送 ${files.length} 个文件。双方 PIN：${pin}\n是否接收？`,
       buttons: [
@@ -637,11 +722,11 @@ struct QuickSharePage {
         parameters: { 'ohos.aafwk.param.bundleName': 'com.cashmere.link' }
       }).catch((error: BusinessError): void => {
         Lg.e('Quick Share open file failed: ' + JSON.stringify(error));
-        promptAction.showToast({ message: '无法打开：' + (error.message ?? ''), duration: 2000 });
+        promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开：' + (error.message ?? ''), duration: 2000 });
       });
     } catch (error) {
       Lg.e('Quick Share open file error: ' + JSON.stringify(error));
-      promptAction.showToast({ message: '无法打开文件', duration: 2000 });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开文件', duration: 2000 });
     }
   }
 }

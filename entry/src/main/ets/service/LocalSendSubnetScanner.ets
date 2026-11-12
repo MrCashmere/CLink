@@ -1,7 +1,11 @@
 import { LogCapture as Lg } from '../common/LogCapture';
 import { socket } from '@kit.NetworkKit';
-import { BusinessError } from '@kit.BasicServicesKit';
+import { common } from '@kit.AbilityKit';
+import fs from '@ohos.file.fs';
+import { CertificateStore } from '../common/CertificateStore';
+import { ByteTransport, Transports } from '../common/TlsTransport';
 import { ByteUtils } from '../common/ByteUtils';
+import { HttpBodyParser } from '../common/HttpBodyParser';
 import { DeviceEndpoint } from '../model/TransferModels';
 
 const PORT = 53317;
@@ -11,14 +15,13 @@ const PORT = 53317;
 // 注意：@ohos.net.socket 的异步 connect 在其“主线程完成回调(OnTcpConnectComplete)”
 // 与后台 ConnectMonitor 线程之间存在一个已知的释放竞争——若我们在 connect 仍被框架
 // 完结时就把大量 socket 同时 close，两个线程会去 free 同一个连接上下文，触发
-// “may double free” SIGTRAP。因此这里刻意
+// “may double free” SIGTRAP（见 docs/LOCALSEND_TLS.md run-12）。因此这里刻意
 // 压低并发、拉长 connect 超时，让扫描进程更慢但更稳，避免同刻产生过多
 // “还在完结中就被 close”的 connect。
 const CONNECT_TIMEOUT_MS = 1500;
 const READ_TIMEOUT_MS = 2500;
 const INFO_PATHS: string[] = ['/api/localsend/v2/info', '/api/localsend/v1/info', '/api/info'];
 const CONCURRENCY = 4;
-const CRLF_CRLF = new Uint8Array([13, 10, 13, 10]);
 
 type DeviceEmitter = (device: DeviceEndpoint) => void;
 type AddressChecker = (address: string) => boolean;
@@ -40,9 +43,13 @@ export class LocalSendSubnetScanner {
   private readonly emit: DeviceEmitter;
   private readonly isOwn: AddressChecker;
   private running = false;
+  private generation = 0;
+  private readonly cancellations: Set<() => void> = new Set();
+  private readonly certs: CertificateStore;
   private foundCount = 0;
 
-  constructor(emit: DeviceEmitter, isOwn: AddressChecker) {
+  constructor(emit: DeviceEmitter, isOwn: AddressChecker, context: common.Context) {
+    this.certs = new CertificateStore(context);
     this.emit = emit;
     this.isOwn = isOwn;
   }
@@ -55,16 +62,17 @@ export class LocalSendSubnetScanner {
     if (parts.length !== 4) {
       return;
     }
+    const generation = this.generation;
     this.running = true;
     this.foundCount = 0;
     try {
       let next = 1;
       const worker = async (): Promise<void> => {
-        while (next <= 254) {
+        while (next <= 254 && generation === this.generation) {
           const host = parts[0] + '.' + parts[1] + '.' + parts[2] + '.' + next;
           next += 1;
           if (!this.isOwn(host)) {
-            await this.probe(host);
+            await this.probe(host, generation);
           }
         }
       };
@@ -79,21 +87,16 @@ export class LocalSendSubnetScanner {
     }
   }
 
-  /** 自连本机 IP:53317，检测 TCP 服务端是否真正监听并响应 /info。 */
-  async probeSelf(host: string): Promise<boolean> {
-    const result = await this.requestInfo(host, '/api/localsend/v2/info');
-    const raw = result.raw;
-    if (raw !== '') {
-      const split = raw.indexOf('\r\n\r\n');
-      if (split < 0) {
-        return false;
-      }
-      const status = raw.substring(0, split).split(' ')[1] ?? '';
-      if (status === '200') {
-        return true;
-      }
-    }
-    return false;
+  stop(): void {
+    this.generation += 1;
+    this.cancellations.forEach((cancel: () => void): void => cancel());
+    this.cancellations.clear();
+  }
+
+  /** 自检必须采用本机实际监听的协议，否则 HTTPS 会被误报为未启动。 */
+  async probeSelf(host: string, secure: boolean = false): Promise<boolean> {
+    const result = await this.requestInfo(host, INFO_PATHS[0], secure);
+    return result.raw.startsWith('HTTP/1.1 200 ') || result.raw.startsWith('HTTP/1.0 200 ');
   }
 
   /** 托底连接：容忍 EINPROGRESS，用 connect 事件 + getState().isConnected 判定真实连接。 */
@@ -150,7 +153,7 @@ export class LocalSendSubnetScanner {
     return text.indexOf('2301115') >= 0 ? 2301115 : 0;
   }
 
-  private async probe(host: string): Promise<void> {
+  private async probe(host: string, generation: number): Promise<void> {
     // Try each known info path on its own TCP connection. A shared socket +
     // a single settled Promise breaks multi-path probing because the second
     // request reads the already-resolved first response.
@@ -158,6 +161,9 @@ export class LocalSendSubnetScanner {
     let openPorts = 0;
     for (const infoPath of INFO_PATHS) {
       const result = await this.requestInfo(host, infoPath);
+      if (generation !== this.generation) {
+        return;
+      }
       if (result.connected) {
         anyTcpConnected = true;
         openPorts += 1;
@@ -187,78 +193,196 @@ export class LocalSendSubnetScanner {
         Lg.w('LocalSend subnet parse failed ' + host + ': ' + JSON.stringify(error));
         continue;
       }
-      const rawPort = info.port !== undefined && info.port > 0 ? info.port : PORT;
-      const peerPort = Number(rawPort) > 0 ? Number(rawPort) : PORT;
+      if (info === null || typeof info !== 'object' || typeof info.alias !== 'string'
+        || (info.protocol !== undefined && typeof info.protocol !== 'string')) {
+        continue;
+      }
+      const peerPort = typeof info.port === 'number' && Number.isInteger(info.port)
+        && info.port > 0 && info.port <= 65535 ? info.port : PORT;
       const https = (info.protocol ?? '').toLowerCase() === 'https';
       Lg.i('LocalSend subnet peer ' + host + ':' + peerPort + ' alias=' + (info.alias ?? host) + ' https=' + https);
       this.foundCount += 1;
       this.emit({
         id: 'localsend:' + host + ':' + peerPort,
         name: info.alias ?? host,
-        model: info.deviceModel ?? 'LocalSend device',
+        model: typeof info.deviceModel === 'string' ? info.deviceModel : 'LocalSend device',
         protocol: 'localsend',
         address: host,
         port: peerPort,
         https,
-        fingerprint: info.fingerprint ?? '',
+        fingerprint: typeof info.fingerprint === 'string' ? info.fingerprint : '',
         source: 'lan'
       });
       return;
     }
     if (anyTcpConnected) {
+      // 端口开着但没有 HTTP 响应 → 极可能是**只讲 TLS 的对端**（官方 LocalSend 默认 HTTPS + 自签证书）。
+      // 这正是「搜不到对端 LocalSend App」的第二条原因：老实现到这里就结束了，从没做过 TLS 探测
+      // （注释里写了要做，代码里没有）。补上：跳过证书校验发一次 GET。
       Lg.i('LocalSend subnet host ' + host + ':' + PORT
-        + ' port open (' + openPorts + ' path connection(s)) but no /info HTTP 200 (HTTP-only)');
+        + ' port open (' + openPorts + ' path connection(s)) but no /info HTTP 200 → 试 TLS');
+      await this.probeTls(host, generation);
     }
   }
 
-  private async requestInfo(host: string, infoPath: string): Promise<InfoProbeResult> {
-    const tcp = socket.constructTCPSocketInstance();
-    let dataBytes = new Uint8Array(0);
-    let connected = false;
-    try {
-      const response = new Promise<string>((resolve) => {
-        tcp.on('message', (info: socket.SocketMessageInfo): void => {
-          // 按字节累积，不能用 JS 字符串长度比较 Content-Length：
-          // 响应体含中文（别名/设备名）时 UTF-8 一个字符占 3 字节，
-          // 字符串 length 会小于真实字节数，导致永远判定为“体不完整”。
-          dataBytes = ByteUtils.concat([dataBytes, new Uint8Array(info.message)]);
-          const split = ByteUtils.indexOf(dataBytes, CRLF_CRLF, 0);
-          if (split >= 0) {
-            const header = ByteUtils.decodeText(dataBytes.slice(0, split)).toLowerCase();
-            const match = header.match(/content-length:\s*(\d+)/);
-            const expected = match === null ? -1 : parseInt(match[1], 10);
-            const bodyBytes = dataBytes.length - (split + 4);
-            if (expected < 0 || bodyBytes >= expected) {
-              resolve(ByteUtils.decodeText(dataBytes));
-            }
-          } else if (dataBytes.length > 8192) {
-            resolve(ByteUtils.decodeText(dataBytes));
-          }
-        });
-      });
-      // HarmonyOS 部分版本 tcp.connect 返回 2301115(EINPROGRESS) 后可能既不 resolve
-      // 也不 reject、也不触发 connect 事件；直接用 connect 事件 + getState() 轮询
-      // 判定真实连接，避免把已建立连接误判为超时而提前 close。
-      const ok = await LocalSendSubnetScanner.connectChecked(tcp, host, PORT);
-      if (!ok) {
-        return { raw: '', connected: false };
+  /** 与发送共用原生 TLS 和客户端证书，避免另一套 TLSSocket 握手路径。 */
+  private async probeTls(host: string, generation: number): Promise<void> {
+    for (const infoPath of INFO_PATHS) {
+      const result = await this.requestInfo(host, infoPath, true);
+      if (generation !== this.generation || result.raw === '') {
+        return;
       }
-      connected = true;
-      await tcp.send({ data: ByteUtils.toArrayBuffer(ByteUtils.encodeText(
-        'GET ' + infoPath + ' HTTP/1.1\r\nHost: ' + host + '\r\nConnection: close\r\n\r\n'
-      )) });
-      const raw = await Promise.race([
-        response,
-        new Promise<string>((resolve) => setTimeout(() => resolve(''), READ_TIMEOUT_MS))
-      ]);
-      return { raw, connected };
-    } catch (error) {
-      return { raw: '', connected };
-    } finally {
-      tcp.close().catch((error: BusinessError): void => {
-        void error;
-      });
+      const split = result.raw.indexOf('\r\n\r\n');
+      if (split < 0 || result.raw.substring(0, split).split(' ')[1] !== '200') {
+        continue;
+      }
+      try {
+        const info = JSON.parse(result.raw.substring(split + 4)) as LocalSendPeerInfo;
+        if (info === null || typeof info !== 'object' || typeof info.alias !== 'string'
+        || (info.protocol !== undefined && typeof info.protocol !== 'string')) {
+          continue;
+        }
+        const port = typeof info.port === 'number' && Number.isInteger(info.port)
+          && info.port > 0 && info.port <= 65535 ? info.port : PORT;
+        this.foundCount += 1;
+        this.emit({
+          id: 'localsend:' + host + ':' + port,
+          name: info.alias,
+          model: typeof info.deviceModel === 'string' ? info.deviceModel : 'LocalSend device',
+          protocol: 'localsend', address: host, port, https: true,
+          fingerprint: typeof info.fingerprint === 'string' ? info.fingerprint : '', source: 'lan'
+        });
+        return;
+      } catch (error) {
+        Lg.w('LocalSend subnet TLS info parse failed ' + host + ': ' + JSON.stringify(error));
+      }
     }
   }
 
+  /**
+   * 判断响应是否已经**完整**收到；完整则返回「头部 + 完整 body」的字节（供上层按 `\r\n\r\n` 切分）。
+   *
+   * 真机踩过的坑：官方 LocalSend（Dart）的 `/info` 响应是 `Transfer-Encoding: chunked`、没有
+   * `Content-Length`。老实现把「没有 Content-Length」当成「已经收完」，于是**只拿到响应头就 resolve**，
+   * 之后的 `JSON.parse` 必然失败 → 子网扫描永远发现不了对端。这里用共享的 `HttpBodyParser`：
+   * chunked 走解块、有长度等够长度、两者都没有则等 JSON 完整；调用方限制大小和总等待时间。
+   */
+  private static completeResponse(bytes: Uint8Array): Uint8Array | undefined {
+    const headerEnd = HttpBodyParser.headerEnd(bytes);
+    if (headerEnd < 0) {
+      return undefined;
+    }
+    const parsed = HttpBodyParser.parseHead(
+      ByteUtils.decodeText(bytes.slice(0, headerEnd)));
+    const body = bytes.slice(headerEnd + 4);
+    if (parsed.chunked) {
+      const decoded = HttpBodyParser.decodeChunked(body);
+      if (decoded === undefined) {
+        return undefined;
+      }
+      return ByteUtils.concat([bytes.slice(0, headerEnd + 4), decoded]);
+    }
+    if (parsed.contentLength >= 0) {
+      return body.length >= parsed.contentLength ? bytes.slice(0, headerEnd + 4 + parsed.contentLength) : undefined;
+    }
+    // 无长度且非 chunked：只能靠调用方的读超时/上限兜底。
+    try {
+      JSON.parse(ByteUtils.decodeText(body));
+      return bytes;
+    } catch (error) {
+      return undefined;
+    }
+  }
+
+  private async requestInfo(host: string, infoPath: string, secure: boolean = false): Promise<InfoProbeResult> {
+    let connected = false;
+    let finished = false;
+    let transport: ByteTransport | undefined;
+    let tcp: socket.TCPSocket | undefined;
+    let tcpClosed = false;
+    const closeTcp = (): void => {
+      if (tcp !== undefined && !tcpClosed) {
+        tcpClosed = true;
+        void tcp.close().catch((): void => {});
+      }
+    };
+    let dataBytes = new Uint8Array(0);
+    let resolveResponse: (value: string) => void = (): void => {};
+    const response = new Promise<string>((resolve: (value: string) => void): void => {
+      resolveResponse = resolve;
+    });
+    const finish = (raw: string): void => {
+      if (!finished) {
+        finished = true;
+        resolveResponse(raw);
+      }
+    };
+    const cancel = (): void => finish('');
+    this.cancellations.add(cancel);
+    // Covers certificate loading, connect, handshake, send and response, not only read.
+    const timer = setTimeout(cancel, CONNECT_TIMEOUT_MS + READ_TIMEOUT_MS);
+    const onData = (bytes: Uint8Array): void => {
+      if (finished) {
+        return;
+      }
+      if (dataBytes.length + bytes.length > 65536) {
+        finish('');
+        return;
+      }
+      dataBytes = ByteUtils.concat([dataBytes, bytes]);
+      const ready = LocalSendSubnetScanner.completeResponse(dataBytes);
+      if (ready !== undefined) {
+        finish(ByteUtils.decodeText(ready));
+      }
+    };
+    const request = ByteUtils.encodeText('GET ' + infoPath + ' HTTP/1.1\r\nHost: '
+      + host + '\r\nConnection: close\r\n\r\n');
+    const run = async (): Promise<void> => {
+      if (secure) {
+        const material = await this.certs.ensure();
+        if (finished) {
+          return;
+        }
+        const certPem = material === undefined ? '' : await fs.readText(material.certPath);
+        const keyPem = material === undefined ? '' : await fs.readText(material.keyPath);
+        if (finished) {
+          return;
+        }
+        const opened = await Transports.open(host, PORT, true, certPem, keyPem);
+        if (finished) {
+          void opened.close().catch((): void => {});
+          return;
+        }
+        transport = opened;
+        connected = true;
+        opened.onData(onData);
+        await opened.send(request);
+      } else {
+        const instance = socket.constructTCPSocketInstance();
+        tcp = instance;
+        instance.on('message', (info: socket.SocketMessageInfo): void => onData(new Uint8Array(info.message)));
+        instance.on('close', cancel);
+        const ok = await LocalSendSubnetScanner.connectChecked(instance, host, PORT);
+        if (finished || !ok) {
+          // Also releases a connection whose completion arrives after cancellation.
+          closeTcp();
+          finish('');
+          return;
+        }
+        connected = true;
+        await instance.send({ data: ByteUtils.toArrayBuffer(request) });
+      }
+    };
+    void run().catch(cancel);
+    try {
+      return { raw: await response, connected };
+    } finally {
+      clearTimeout(timer);
+      this.cancellations.delete(cancel);
+      if (transport !== undefined) {
+        void transport.close().catch((): void => {});
+      }
+      closeTcp();
+    }
+  }
 }

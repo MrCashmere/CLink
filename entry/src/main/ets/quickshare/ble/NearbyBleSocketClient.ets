@@ -10,6 +10,7 @@ import {
   WEAVE_VERSION,
   WEAVE_HEADER_SIZE,
   WEAVE_MAX_PACKET_SIZE,
+  WEAVE_DEFAULT_ATT_PAYLOAD_SIZE,
   WEAVE_MAX_PACKET_COUNTER,
   WeaveConnectionConfirm,
   WeaveConnectionClose,
@@ -19,6 +20,8 @@ import {
 import { GsStreamConnection } from '../../protocol/gs/GsFacade';
 
 const CONNECT_TIMEOUT_MS: number = 8000;
+const WEAVE_CONFIRM_TIMEOUT_MS: number = 3000;
+const MAX_MESSAGE_BYTES: number = 1024 * 1024;
 
 interface BleSocketChars {
   readonly serviceUuid: string;
@@ -36,55 +39,59 @@ interface BleSocketChars {
  */
 export class NearbyBleSocketClient {
   private gattClient?: ble.GattClientDevice;
-  private writeServiceUuid: string = '';
   private writeChar?: ble.BLECharacteristic;
   private stream?: BleClientStream;
 
   async connect(mac: string): Promise<GsStreamConnection> {
-    Lg.i('[QUICKSHARE][BLE client] connecting to mac=' + mac);
-    const client: ble.GattClientDevice = ble.createGattClientDevice(mac);
+    if (this.gattClient !== undefined) { throw new Error('BLE 已有活动连接'); }
+    const client = ble.createGattClientDevice(mac);
     this.gattClient = client;
-    await NearbyBleSocketClient.waitConnected(client);
-    const services: ble.GattService[] = await client.getServices();
-    for (const svc of services) {
-      Lg.i('[QUICKSHARE][BLE client] service=' + svc.serviceUuid
-        + ' chars=' + svc.characteristics.map((c: ble.BLECharacteristic): string => c.characteristicUuid).join(','));
-    }
-    const socket: BleSocketChars | undefined = NearbyBleSocketClient.findSocketChars(services);
-    if (socket === undefined) {
-      await client.close();
-      throw new Error('对端未发现 Nearby BLE socket 服务（无 0101/0102 Weave 特征）。'
-        + '对端可能正处于发送态、未广播可连接的接收 socket，或未开启「所有人可见」。');
-    }
-    this.writeServiceUuid = socket.serviceUuid;
-    this.writeChar = socket.write;
-    await client.setCharacteristicChangeNotification(socket.notify, true);
-    client.on('BLECharacteristicChange', (char: ble.BLECharacteristic): void => {
-      if (char.characteristicUuid.toLowerCase() === BLE_SOCKET_FROM_PERIPHERAL_UUID.toLowerCase()) {
-        this.stream?.onNotify(new Uint8Array(char.characteristicValue));
+    try {
+      await NearbyBleSocketClient.waitConnected(client);
+      client.on('BLEConnectionStateChange', (state: ble.BLEConnectionChangeState): void => {
+        if (this.gattClient === client && state.state === constant.ProfileConnectionState.STATE_DISCONNECTED) {
+          if (this.stream !== undefined) { this.stream.close(); }
+          else { this.closeStream(); }
+        }
+      });
+      const services = await client.getServices();
+      const chars = NearbyBleSocketClient.findSocketChars(services);
+      if (chars === undefined) { throw new Error('对端未发现 Nearby BLE socket 服务'); }
+      if (this.gattClient !== client) { throw new Error('BLE 连接已关闭'); }
+      this.writeChar = chars.write;
+      const stream = new BleClientStream(this);
+      this.stream = stream;
+      client.on('BLECharacteristicChange', (char: ble.BLECharacteristic): void => {
+        if (this.gattClient === client && char.characteristicUuid.toLowerCase() === BLE_SOCKET_FROM_PERIPHERAL_UUID.toLowerCase()) {
+          stream.onNotify(new Uint8Array(char.characteristicValue));
+        }
+      });
+      await client.setCharacteristicChangeNotification(chars.notify, true);
+      await stream.handshake();
+      return stream;
+    } catch (error) {
+      if (this.gattClient === client) {
+        if (this.stream !== undefined) { this.stream.close(); }
+        else { this.closeStream(); }
       }
-    });
-
-    const stream: BleClientStream = new BleClientStream(this);
-    this.stream = stream;
-    await stream.handshake();
-    Lg.i('[QUICKSHARE][BLE client] connected mac=' + mac + ' service=' + socket.serviceUuid);
-    return stream;
+      throw error as Error;
+    }
   }
 
   closeStream(): void {
+    const client = this.gattClient;
+    this.gattClient = undefined;
+    this.writeChar = undefined;
+    this.stream = undefined;
+    if (client === undefined) { return; }
     try {
-      this.gattClient?.disconnect();
-    } catch (error) {
-      Lg.w('[QUICKSHARE][BLE client] disconnect failed: ' + JSON.stringify(error));
-    }
-    try {
-      this.gattClient?.close();
-    } catch (error) {
+      client.off('BLEConnectionStateChange');
+      client.off('BLECharacteristicChange');
+    } catch (_error) {}
+    try { client.disconnect(); } catch (_error) {}
+    try { client.close(); } catch (error) {
       Lg.w('[QUICKSHARE][BLE client] gatt close failed: ' + JSON.stringify(error));
     }
-    this.gattClient = undefined;
-    this.stream = undefined;
   }
 
   write(packet: Uint8Array): Promise<void> {
@@ -105,32 +112,25 @@ export class NearbyBleSocketClient {
   }
 
   private static async waitConnected(client: ble.GattClientDevice): Promise<void> {
-    await new Promise<void>((resolve: (value: void) => void, reject: (err: Error) => void): void => {
-      let done: boolean = false;
-      const finish = (ok: boolean): void => {
-        if (done) {
-          return;
-        }
-        done = true;
-        if (ok) {
-          resolve();
-        } else {
-          reject(new Error('BLE 连接对端超时/失败'));
-        }
+    await new Promise<void>((resolve: () => void, reject: (err: Error) => void): void => {
+      let done = false;
+      let timer = -1;
+      const onState = (state: ble.BLEConnectionChangeState): void => {
+        if (state.state === constant.ProfileConnectionState.STATE_CONNECTED) { finish(true); }
       };
-      const timer: number = setTimeout((): void => finish(false), CONNECT_TIMEOUT_MS);
-      client.on('BLEConnectionStateChange', (state: ble.BLEConnectionChangeState): void => {
-        if (state.deviceId.toLowerCase().length > 0 && state.state === constant.ProfileConnectionState.STATE_CONNECTED) {
-          clearTimeout(timer);
-          finish(true);
-        }
-      });
-      try {
-        client.connect();
-      } catch (error) {
+      const finish = (ok: boolean): void => {
+        if (done) { return; }
+        done = true;
         clearTimeout(timer);
-        finish(false);
-      }
+        try { client.off('BLEConnectionStateChange', onState); } catch (_error) {}
+        if (ok) { resolve(); }
+        else { reject(new Error('BLE 连接对端超时或失败')); }
+      };
+      timer = setTimeout((): void => finish(false), CONNECT_TIMEOUT_MS);
+      try {
+        client.on('BLEConnectionStateChange', onState);
+        client.connect();
+      } catch (error) { finish(false); }
     });
   }
 
@@ -160,10 +160,10 @@ class BleClientStream implements GsStreamConnection {
   private readonly messageBuffer: number[] = [];
   private packetSize: number = WEAVE_MAX_PACKET_SIZE;
   private sendCounter: number = 0;
-  private introSent: boolean = false;
   private closed: boolean = false;
   private confirmResolve?: () => void;
-  private confirmPromise?: Promise<void>;
+  private confirmReject?: (error: Error) => void;
+  private closeListener?: () => void;
 
   constructor(client: NearbyBleSocketClient) {
     this.client = client;
@@ -173,10 +173,13 @@ class BleClientStream implements GsStreamConnection {
     this.listener = listener;
   }
 
+  onClose(listener: () => void): void {
+    this.closeListener = listener;
+    if (this.closed) { listener(); }
+  }
+
   sendBytes(data: Uint8Array): Promise<void> {
-    if (this.closed) {
-      return Promise.resolve();
-    }
+    if (this.closed) { return Promise.reject(new Error('BLE 连接已关闭')); }
     const payload: Uint8Array = ByteUtils.concat([NEARBY_SERVICE_ID_HASH, data]);
     return this.sendSocketMessage(payload);
   }
@@ -186,7 +189,10 @@ class BleClientStream implements GsStreamConnection {
       return;
     }
     this.closed = true;
+    this.confirmReject?.(new Error('BLE 连接已关闭'));
+    this.messageBuffer.length = 0;
     this.client.closeStream();
+    this.closeListener?.();
   }
 
   onNotify(bytes: Uint8Array): void {
@@ -196,6 +202,11 @@ class BleClientStream implements GsStreamConnection {
     const packet: WeaveConnectionConfirm | WeaveDataPacket | WeaveConnectionClose | undefined =
       NearbyBleSocketCodec.parseWeavePacket(bytes) as WeaveConnectionConfirm | WeaveDataPacket | WeaveConnectionClose | undefined;
     if (packet instanceof WeaveConnectionConfirm) {
+      if (packet.version !== WEAVE_VERSION || packet.packetSize < WEAVE_DEFAULT_ATT_PAYLOAD_SIZE
+        || packet.packetSize > WEAVE_MAX_PACKET_SIZE) {
+        this.close();
+        return;
+      }
       this.packetSize = packet.packetSize;
       if (this.confirmResolve !== undefined) {
         const resolve: () => void = this.confirmResolve;
@@ -207,6 +218,10 @@ class BleClientStream implements GsStreamConnection {
     } else if (packet instanceof WeaveDataPacket) {
       if (packet.firstPacket) {
         this.messageBuffer.length = 0;
+      }
+      if (this.messageBuffer.length + packet.data.length > MAX_MESSAGE_BYTES) {
+        this.close();
+        return;
       }
       for (let i = 0; i < packet.data.length; i++) {
         this.messageBuffer.push(packet.data[i]);
@@ -220,17 +235,23 @@ class BleClientStream implements GsStreamConnection {
   }
 
   async handshake(): Promise<void> {
-    // 1) Weave ConnectionRequest (we are the client/central).
-    const request: Uint8Array = NearbyBleSocketCodec.encodeConnectionRequest(0, WEAVE_VERSION, WEAVE_VERSION, WEAVE_MAX_PACKET_SIZE);
-    await this.client.write(request);
-    // 2) Wait for ConnectionConfirm (the server notifies it). We parse packetSize
-    //    as it arrives, then send the socket Introduction.
-    this.confirmPromise = new Promise<void>((resolve: () => void): void => { this.confirmResolve = resolve; });
-    await Promise.race([this.confirmPromise, BleClientStream.delay(500)]);
-    // 3) BLE socket Introduction (00 00 00 + SocketControlFrame{INTRODUCTION}).
-    const introduction: Uint8Array = NearbyBleSocketCodec.encodeIntroductionPacket(NEARBY_SERVICE_ID_HASH);
-    await this.sendSocketMessage(introduction);
-    this.introSent = true;
+    if (this.closed) { throw new Error('BLE 连接已关闭'); }
+    const confirm = new Promise<void>((resolve: () => void, reject: (error: Error) => void): void => {
+      this.confirmResolve = resolve;
+      this.confirmReject = reject;
+    });
+    const timer = setTimeout((): void => {
+      this.confirmReject?.(new Error('等待 BLE 握手确认超时'));
+    }, WEAVE_CONFIRM_TIMEOUT_MS);
+    try {
+      const request = NearbyBleSocketCodec.encodeConnectionRequest(0, WEAVE_VERSION, WEAVE_VERSION, WEAVE_MAX_PACKET_SIZE);
+      await Promise.all([this.client.write(request), confirm]);
+      await this.sendSocketMessage(NearbyBleSocketCodec.encodeIntroductionPacket(NEARBY_SERVICE_ID_HASH));
+    } finally {
+      clearTimeout(timer);
+      this.confirmResolve = undefined;
+      this.confirmReject = undefined;
+    }
   }
 
   private async sendSocketMessage(payload: Uint8Array): Promise<void> {
@@ -267,7 +288,4 @@ class BleClientStream implements GsStreamConnection {
     }
   }
 
-  static delay(ms: number): Promise<void> {
-    return new Promise<void>((resolve: () => void): void => { setTimeout(resolve, ms); });
-  }
 }

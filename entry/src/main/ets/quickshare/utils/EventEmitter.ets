@@ -4,7 +4,7 @@ export type QuickShareListener<T> = (event: T) => void;
 
 /** App 级 Quick Share 接收事件（由 AppServices 兜底记录/持久化，页面按 kind 消费）。 */
 export interface QuickShareServiceEvent {
-  readonly kind: 'incoming' | 'file' | 'progress';
+  readonly kind: 'incoming' | 'file' | 'progress' | 'transport';
   readonly key?: string;
   readonly peerName?: string;
   readonly files?: SessionFileMeta[];
@@ -12,6 +12,8 @@ export interface QuickShareServiceEvent {
   readonly file?: IncomingFile;
   readonly peer?: string;
   readonly percent?: number;
+  /** kind==='transport' 时的人类可读说明（升级成功/失败/留在原通道）。 */
+  readonly detail?: string;
 }
 
 /** 页面注册的接收确认回调：返回 true 表示接受会话（进行文件落盘），false 表示拒绝。 */

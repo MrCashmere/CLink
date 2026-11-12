@@ -48,13 +48,13 @@ export class NearbyBleCodec {
     parts.push(new Uint8Array([versionByte]));
     parts.push(new Uint8Array(NEARBY_SHARING_SERVICE_ID_HASH));
     // data_size is a big-endian u32 on the wire (BleAdvertisement::operator
-    // ByteArray). An LE length makes a stock scanner mis-size the endpoint
-    // payload and reject the advertisement.
+    // ByteArray / Bada encodeGattAdvertisement). An LE length makes a stock
+    // scanner mis-size the endpoint payload and reject the advertisement.
     parts.push(NearbyBleCodec.writeU32Be(data.length));
     parts.push(data);
     // device_token = first 2 bytes of SHA-256(data), matching Nearby's
-    // BleAdvertisement layout. A zero token makes some stock scanners
-    // reject/ignore the GATT-returned advertisement.
+    // BleAdvertisement layout (Bada encodeGattAdvertisement). A zero token makes
+    // some stock scanners reject/ignore the GATT-returned advertisement.
     const token: Uint8Array = await NearbyBleCodec.sha256Truncated(data, 2);
     parts.push(token);
     return ByteUtils.concat(parts);
@@ -98,9 +98,15 @@ export class NearbyBleCodec {
   }
 
   // Quick Share EndpointInfo: byte0 = (version(3)<<5 | visibility(1)<<4 |
-  // deviceType(3)<<1 | reserved(1)). version MUST be 1; we emit a visible phone,
-  // so byte0 = 0x20 | (phone<<1) = 0x22. Version 0 makes Android's Quick Share
-  // picker fail to parse the name and drop the endpoint from the UI.
+  // deviceType(3)<<1 | reserved(1)). version=1 for a visible phone, so byte0 =
+  // 0x20 | (phone<<1) = 0x22. This matches what a stock Android phone actually
+  // advertises (captured 2026-09-10 from the Android Quick Share BLE GATT
+  // characteristic: "22 4f6fdd9a8f22c5cdf3a149381e62ec 0f e79a93...e69cba"
+  // = byte0 0x22 + 16 random + nameLen 15 + "皓然的手机"). Google's Windows
+  // build advertises 0x06 (version=0, laptop) and is accepted too, so the
+  // version nibble is not what a peer validates. Device names/lengths and the
+  // "IPv4" TXT encoding are the parts that must match exactly - see
+  // docs/UNVERIFIED.md, the 2026-09-10 entry on the malformed IPv4 TXT record.
   private static buildEndpointInfo(deviceName: string): Uint8Array {
     const nameBytes: Uint8Array = ByteUtils.encodeText(deviceName.length > 0 ? deviceName : 'HarmonyOS');
     const nameLen: number = Math.min(nameBytes.length, 255);

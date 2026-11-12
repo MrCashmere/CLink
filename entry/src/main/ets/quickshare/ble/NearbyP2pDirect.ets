@@ -1,5 +1,6 @@
 import { LogCapture as Lg } from '../../common/LogCapture';
 import wifiManager from '@ohos.wifiManager';
+import { WifiDirectLease } from '../../common/WifiDirectLease';
 import { socket } from '@kit.NetworkKit';
 import { ByteUtils } from '../../common/ByteUtils';
 import { GsStreamConnection, WifiDirectUpgradeCredentials } from '../../protocol/gs/GsFacade';
@@ -31,11 +32,15 @@ const ALPHANUM: string = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01
  * the SSID/PSK, whether GO_BAND_2GHZ is accepted) is not yet validated.
  */
 export class NearbyP2pDirect {
+  private readonly p2pLease: WifiDirectLease = new WifiDirectLease('Quick Share');
   private groupActive: boolean = false;
+  private generation: number = 0;
+  private creating?: Promise<P2pGroupCredentials>;
   private lastCredentials?: P2pGroupCredentials;
   private connectionChangeCb?: (state: 'connected' | 'disconnected') => void;
   private readonly connectionChangeListener: (info: wifiManager.WifiP2pLinkedInfo) => void =
     (info: wifiManager.WifiP2pLinkedInfo): void => {
+      if (!this.p2pLease.ownsGroup()) { return; }
       const connected: boolean = info.connectState === wifiManager.P2pConnectState.CONNECTED;
       if (this.connectionChangeCb !== undefined) {
         this.connectionChangeCb(connected ? 'connected' : 'disconnected');
@@ -46,7 +51,14 @@ export class NearbyP2pDirect {
     this.connectionChangeCb = cb;
   }
 
-  async createGroup(): Promise<P2pGroupCredentials> {
+  createGroup(): Promise<P2pGroupCredentials> {
+    if (this.creating !== undefined) { return this.creating; }
+    const generation = ++this.generation;
+    this.creating = this.createOwnedGroup(generation).finally((): void => { this.creating = undefined; });
+    return this.creating;
+  }
+
+  private async createOwnedGroup(generation: number): Promise<P2pGroupCredentials> {
     try {
       wifiManager.on('p2pConnectionChange', this.connectionChangeListener);
     } catch (error) {
@@ -62,9 +74,12 @@ export class NearbyP2pDirect {
       goFreq: 2437
     };
     Lg.i('[QUICKSHARE][P2P] createGroup ssid=' + config.groupName);
-    wifiManager.createGroup(config);
-    const credentials: P2pGroupCredentials | undefined = await this.pollGroup();
+    try { this.p2pLease.createGroup(config); }
+    catch (error) { this.removeGroup(); throw error as Error; }
+    const credentials: P2pGroupCredentials | undefined = await this.pollGroup(generation);
+    if (generation !== this.generation || !this.p2pLease.ownsGroup()) { throw new Error('Wi-Fi Direct 建组已取消'); }
     if (credentials === undefined) {
+      this.removeGroup();
       Lg.w('[QUICKSHARE][P2P] group formation timed out or GO info missing');
       return {
         groupName: config.groupName,
@@ -84,18 +99,17 @@ export class NearbyP2pDirect {
   }
 
   removeGroup(): void {
-    if (!this.groupActive) {
-      return;
-    }
+    this.generation += 1;
     this.groupActive = false;
+    this.lastCredentials = undefined;
     try {
       wifiManager.off('p2pConnectionChange', this.connectionChangeListener);
     } catch (error) {
       Lg.w('[QUICKSHARE][P2P] unsubscribe p2pConnectionChange failed: ' + JSON.stringify(error));
     }
     try {
-      wifiManager.removeGroup();
-      Lg.i('[QUICKSHARE][P2P] removed group');
+      this.p2pLease.removeGroup().catch((error: Error): void => Lg.w('[QUICKSHARE][P2P] ' + error.message));
+      Lg.i('[QUICKSHARE][P2P] group cleanup requested');
     } catch (error) {
       Lg.w('[QUICKSHARE][P2P] removeGroup failed: ' + JSON.stringify(error));
     }
@@ -127,13 +141,15 @@ export class NearbyP2pDirect {
         goFreq: creds.frequency > 0 ? creds.frequency : undefined
       };
       Lg.i('[QUICKSHARE][P2P] client connect ssid=' + creds.ssid + ' gateway=' + creds.gateway + ' port=' + creds.port);
-      wifiManager.p2pConnect(config);
-      await NearbyP2pDirect.pollConnected();
+      this.p2pLease.connect(config);
+      if (!await NearbyP2pDirect.pollConnected()) { throw new Error('Wi-Fi Direct 连接超时'); }
       const tcp: socket.TCPSocket = socket.constructTCPSocketInstance();
-      await tcp.connect({ address: { address: creds.gateway, family: 1, port: creds.port } });
+      try { await tcp.connect({ address: { address: creds.gateway, family: 1, port: creds.port } }); }
+      catch (error) { await tcp.close().catch((): void => undefined); throw error as Error; }
       Lg.i('[QUICKSHARE][P2P] client TCP connected to ' + creds.gateway + ':' + creds.port);
-      return new WifiDirectClientStream(tcp);
+      return new WifiDirectClientStream(tcp, (): void => this.removeGroup());
     } catch (error) {
+      this.removeGroup();
       Lg.w('[QUICKSHARE][P2P] connectAsClient failed: ' + JSON.stringify(error));
       return undefined;
     }
@@ -158,9 +174,10 @@ export class NearbyP2pDirect {
     return false;
   }
 
-  private async pollGroup(): Promise<P2pGroupCredentials | undefined> {
+  private async pollGroup(generation: number): Promise<P2pGroupCredentials | undefined> {
     const deadline: number = Date.now() + GO_POLL_TIMEOUT_MS;
     while (Date.now() < deadline) {
+      if (generation !== this.generation || !this.p2pLease.ownsGroup()) { return undefined; }
       const credentials: P2pGroupCredentials | undefined = await this.readGroup();
       if (credentials !== undefined && credentials.goIpAddress.length > 0) {
         return credentials;
@@ -209,9 +226,15 @@ export class NearbyP2pDirect {
 
 class WifiDirectClientStream implements GsStreamConnection {
   private readonly tcp: socket.TCPSocket;
+  private released: boolean = false;
+  private closeListener?: () => void;
+  private readonly releaseGroup: () => void;
 
-  constructor(tcp: socket.TCPSocket) {
+  constructor(tcp: socket.TCPSocket, releaseGroup: () => void) {
     this.tcp = tcp;
+    this.releaseGroup = releaseGroup;
+    tcp.on('close', (): void => this.release());
+    tcp.on('error', (): void => this.close());
   }
 
   sendBytes(data: Uint8Array): Promise<void> {
@@ -222,7 +245,19 @@ class WifiDirectClientStream implements GsStreamConnection {
     this.tcp.on('message', (info: socket.SocketMessageInfo): void => listener(new Uint8Array(info.message)));
   }
 
+  onClose(listener: () => void): void {
+    this.closeListener = listener;
+    if (this.released) { listener(); }
+  }
+
   close(): void {
-    this.tcp.close().catch((): void => undefined);
+    this.tcp.close().catch((): void => undefined).finally((): void => this.release());
+  }
+
+  private release(): void {
+    if (this.released) { return; }
+    this.released = true;
+    this.closeListener?.();
+    this.releaseGroup();
   }
 }

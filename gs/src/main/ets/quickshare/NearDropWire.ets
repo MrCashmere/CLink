@@ -1,6 +1,7 @@
 import { GsBytes } from '../util/GsBytes';
 import { ProtoWire } from './ProtoWire';
 import { ProtoReader } from './ProtoReader';
+import { NearbyCapabilities } from './NearbyCapabilities';
 
 export enum OfflineType { CONNECTION_REQUEST = 1, CONNECTION_RESPONSE = 2, PAYLOAD_TRANSFER = 3, BANDWIDTH_UPGRADE_NEGOTIATION = 4, KEEP_ALIVE = 5, DISCONNECTION = 6, PAIRED_KEY_ENCRYPTION = 7 }
 export enum SharingType { INTRODUCTION = 1, RESPONSE = 2, PAIRED_KEY_ENCRYPTION = 3, PAIRED_KEY_RESULT = 4, CANCEL = 6 }
@@ -22,8 +23,8 @@ export interface PayloadFile {
   attachmentHash?: number;
 }
 export interface OfflineDecoded { type: number; body: Uint8Array; }
-export interface PayloadDecoded { id: number; type: number; totalSize: number; name: string; offset: number; flags: number; body: Uint8Array; }
-export interface PayloadTransferDecoded { id: number; type: number; totalSize: number; offset: number; flags: number; body: Uint8Array; }
+export interface PayloadDecoded { id: number; idKey: string; packetType: number; type: number; totalSize: number; name: string; offset: number; flags: number; body: Uint8Array; }
+export interface PayloadTransferDecoded { id: number; idKey: string; packetType: number; type: number; totalSize: number; offset: number; flags: number; body: Uint8Array; }
 export interface SharingDecoded { type: number; body: Uint8Array; }
 
 export class NearDropWire {
@@ -86,7 +87,21 @@ export class NearDropWire {
     return GsBytes.decodeText(info.slice(18, 18 + len));
   }
 
-  static connectionRequest(endpointId: string, endpointName: string, info: Uint8Array, handshake: Uint8Array): Uint8Array { return NearDropWire.offline(1, ProtoWire.message([ProtoWire.fieldString(1, endpointId), ProtoWire.fieldString(2, endpointName), ProtoWire.fieldEnum(5, 5), ProtoWire.fieldBytes(6, info)])); }
+  // ConnectionRequestFrame：字段顺序按 proto 升序；`mediums`(5) 是 repeated（非 packed），每个介质一个 varint。
+  // 之前这里只声明了 `WIFI_LAN(5)`，官方端因此没有理由给我们 Wi-Fi Direct 通道；现在补上 `WIFI_DIRECT(8)`
+  // 与 `medium_metadata`(7)（P2P 角色 + 凭据类型），理由见 docs/WIFI_DIRECT.md §2.4/§2.5。
+  static connectionRequest(endpointId: string, endpointName: string, info: Uint8Array, handshake: Uint8Array): Uint8Array {
+    const parts: Uint8Array[] = [
+      ProtoWire.fieldString(1, endpointId),
+      ProtoWire.fieldString(2, endpointName)
+    ];
+    for (const medium of NearbyCapabilities.UPGRADE_MEDIUMS) {
+      parts.push(ProtoWire.fieldEnum(5, medium));
+    }
+    parts.push(ProtoWire.fieldBytes(6, info));
+    parts.push(ProtoWire.nested(7, NearbyCapabilities.mediumMetadata()));
+    return NearDropWire.offline(1, ProtoWire.message(parts));
+  }
   static connectionResponse(handshake: Uint8Array, accepted: boolean = true): Uint8Array { const status: Uint8Array = ProtoWire.message([ProtoWire.fieldEnum(1, 0)]); return NearDropWire.offline(2, ProtoWire.message([ProtoWire.fieldInt32(1, 0), ProtoWire.fieldBytes(2, handshake), ProtoWire.fieldEnum(3, accepted ? 1 : 2), ProtoWire.nested(4, status), ProtoWire.fieldInt32(9, 15000)])); }
   // Nearby Connections requires BOTH peers to send a CONNECTION_RESPONSE. The
   // client (sender) sends this minimal ACCEPT after it receives the server's,
@@ -114,17 +129,18 @@ export class NearDropWire {
   static payloadBytes(id: number, body: Uint8Array): Uint8Array { const header: Uint8Array = ProtoWire.message([ProtoWire.fieldInt64(1, id), ProtoWire.fieldEnum(2, 1), ProtoWire.fieldInt64(3, body.length)]); const chunk: Uint8Array = ProtoWire.message([ProtoWire.fieldInt32(1, LAST_CHUNK), ProtoWire.fieldInt64(2, 0), ProtoWire.fieldBytes(3, body)]); return NearDropWire.offline(3, ProtoWire.message([ProtoWire.fieldEnum(1, 1), ProtoWire.nested(2, header), ProtoWire.nested(3, chunk)])); }
   // The Nearby Connections PayloadTransfer envelope. negotiation/share frames
   // are carried as BYTES payloads exactly as rquickshare/NearDrop send them,
-  // split into a full-data packet + a 0-byte LAST_CHUNK packet. FILE payloads
-  // only send real chunks and set LAST_CHUNK on the final real chunk.
+  // split into a full-data packet + a 0-byte LAST_CHUNK packet (see
+  // docs/PROTOCOL.md "payload layer"). FILE payloads only send real chunks
+  // and set LAST_CHUNK on the final real chunk.
   private static payloadHeader(id: number, totalSize: number): Uint8Array { return ProtoWire.message([ProtoWire.fieldInt64(1, id), ProtoWire.fieldEnum(2, 1), ProtoWire.fieldInt64(3, totalSize), ProtoWire.fieldBool(4, false)]); }
   private static payloadTransferBody(header: Uint8Array, chunk: Uint8Array): Uint8Array { return ProtoWire.message([ProtoWire.fieldEnum(1, 1), ProtoWire.nested(2, header), ProtoWire.nested(3, chunk)]); }
   static payloadTransferEnvelope(sharing: Uint8Array, payloadId: number): Uint8Array { const header: Uint8Array = NearDropWire.payloadHeader(payloadId, sharing.length); const chunk: Uint8Array = ProtoWire.message([ProtoWire.fieldInt32(1, 0), ProtoWire.fieldInt64(2, 0), ProtoWire.fieldBytes(3, sharing)]); return NearDropWire.offline(3, NearDropWire.payloadTransferBody(header, chunk)); }
   static payloadTransferLastChunk(payloadId: number, totalSize: number): Uint8Array { const header: Uint8Array = NearDropWire.payloadHeader(payloadId, totalSize); const chunk: Uint8Array = ProtoWire.message([ProtoWire.fieldInt32(1, 1), ProtoWire.fieldInt64(2, totalSize), ProtoWire.fieldBytes(3, new Uint8Array(0))]); return NearDropWire.offline(3, NearDropWire.payloadTransferBody(header, chunk)); }
-  static parsePayloadTransfer(offline: OfflineDecoded): PayloadTransferDecoded { const body: Uint8Array = offline.body; const header: Uint8Array | undefined = ProtoReader.firstBytes(body, 2); const chunk: Uint8Array | undefined = ProtoReader.firstBytes(body, 3); if (header === undefined || chunk === undefined) throw new Error('invalid PayloadTransferFrame'); return { id: ProtoReader.firstVarint(header, 1) ?? 0, type: ProtoReader.firstVarint(header, 2) ?? 0, totalSize: ProtoReader.firstVarint(header, 3) ?? 0, offset: ProtoReader.firstVarint(chunk, 2) ?? 0, flags: ProtoReader.firstVarint(chunk, 1) ?? 0, body: ProtoReader.firstBytes(chunk, 3) ?? new Uint8Array(0) }; }
+  static parsePayloadTransfer(offline: OfflineDecoded): PayloadTransferDecoded { const body: Uint8Array = offline.body; const header: Uint8Array | undefined = ProtoReader.firstBytes(body, 2); const chunk: Uint8Array | undefined = ProtoReader.firstBytes(body, 3); if (header === undefined || chunk === undefined) throw new Error('invalid PayloadTransferFrame'); return { id: ProtoReader.firstVarint(header, 1) ?? 0, idKey: ProtoReader.firstVarintKey(header, 1) ?? '', packetType: ProtoReader.firstVarint(body, 1) ?? 0, type: ProtoReader.firstVarint(header, 2) ?? 0, totalSize: ProtoReader.firstVarint(header, 3) ?? 0, offset: ProtoReader.firstVarint(chunk, 2) ?? 0, flags: ProtoReader.firstVarint(chunk, 1) ?? 0, body: ProtoReader.firstBytes(chunk, 3) ?? new Uint8Array(0) }; }
   // Accepts either the whole OfflineFrame(PAYLOAD_TRANSFER) or the inner
   // payload_transfer message and returns the payload_transfer body.
   private static payloadTransferBodyFrom(raw: Uint8Array): Uint8Array { if (ProtoReader.firstVarint(raw, 1) === 1) { const v1: Uint8Array | undefined = ProtoReader.firstBytes(raw, 2); if (v1 !== undefined) { const body: Uint8Array | undefined = ProtoReader.firstBytes(v1, 4); if (body !== undefined) return body; } } return raw; }
-  static parsePayload(raw: Uint8Array): PayloadDecoded { const body: Uint8Array = NearDropWire.payloadTransferBodyFrom(raw); const header: Uint8Array | undefined = ProtoReader.firstBytes(body, 2); const chunk: Uint8Array | undefined = ProtoReader.firstBytes(body, 3); if (header === undefined || chunk === undefined) throw new Error('invalid PayloadTransferFrame'); return { id: ProtoReader.firstVarint(header, 1) ?? 0, type: ProtoReader.firstVarint(header, 2) ?? 0, totalSize: ProtoReader.firstVarint(header, 3) ?? 0, name: GsBytes.decodeText(ProtoReader.firstBytes(header, 5) ?? new Uint8Array(0)), offset: ProtoReader.firstVarint(chunk, 2) ?? 0, flags: ProtoReader.firstVarint(chunk, 1) ?? 0, body: ProtoReader.firstBytes(chunk, 3) ?? new Uint8Array(0) }; }
+  static parsePayload(raw: Uint8Array): PayloadDecoded { const body: Uint8Array = NearDropWire.payloadTransferBodyFrom(raw); const header: Uint8Array | undefined = ProtoReader.firstBytes(body, 2); const chunk: Uint8Array | undefined = ProtoReader.firstBytes(body, 3); if (header === undefined || chunk === undefined) throw new Error('invalid PayloadTransferFrame'); return { id: ProtoReader.firstVarint(header, 1) ?? 0, idKey: ProtoReader.firstVarintKey(header, 1) ?? '', packetType: ProtoReader.firstVarint(body, 1) ?? 0, type: ProtoReader.firstVarint(header, 2) ?? 0, totalSize: ProtoReader.firstVarint(header, 3) ?? 0, name: GsBytes.decodeText(ProtoReader.firstBytes(header, 5) ?? new Uint8Array(0)), offset: ProtoReader.firstVarint(chunk, 2) ?? 0, flags: ProtoReader.firstVarint(chunk, 1) ?? 0, body: ProtoReader.firstBytes(chunk, 3) ?? new Uint8Array(0) }; }
   static sharing(type: number, body: Uint8Array): Uint8Array { const v1: Uint8Array = ProtoWire.message([ProtoWire.fieldEnum(1, type), ProtoWire.nested(type === 1 ? 2 : type === 2 ? 3 : type === 3 ? 4 : type === 4 ? 5 : 6, body)]); return ProtoWire.message([ProtoWire.fieldEnum(1, 1), ProtoWire.nested(2, v1)]); }
   static parseSharing(raw: Uint8Array): SharingDecoded { const root: Uint8Array = raw; const v1: Uint8Array = ProtoReader.firstBytes(root, 2) ?? new Uint8Array(0); const type: number = ProtoReader.firstVarint(v1, 1) ?? 0; const field: number = type === 1 ? 2 : type === 2 ? 3 : type === 3 ? 4 : type === 4 ? 5 : 6; return { type, body: ProtoReader.firstBytes(v1, field) ?? new Uint8Array(0) }; }
   // A unique positive attachment id: the official Windows receiver keys each

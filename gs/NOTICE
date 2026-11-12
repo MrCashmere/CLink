@@ -1,0 +1,109 @@
+gs — QUICK SHARE / WINDOWS NEARBY PROTOCOL MODULE
+===================================================
+
+This module (the "gs" HarmonyOS HAR) is distributed under the GNU General
+Public License, version 3 (see the LICENSE file in this directory for the
+full license text).
+
+The module is a clean-room re-implementation that is derived, in part, from
+and/or designed for compatibility with the following third-party projects.
+Their source code, structure and protocol semantics were used as reference
+material during the rewrite. This NOTICE documents those derivations as
+required by their respective licenses and by good attribution practice.
+
+--------------------------------------------------------------------------------
+1. Bada — Samsung Quick Share protocol reference
+--------------------------------------------------------------------------------
+   Project   : Bada
+   Author    : Kyujin Cho <kyujin.cho>
+   Homepage  : https://github.com/kyujin-cho/Bada
+   License   : MIT License (as published in the project's LICENSE file)
+
+   Used as the reference for:
+     - Quick Share (offline) session establishment and encryption key
+       derivation semantics (EC P-256 key agreement + PBKDF2 password-based
+       key derivation + AES-256-GCM data plane);
+     - PIN / verification-code derivation that both endpoints compute
+       independently from the negotiated shared secret;
+     - transfer efficiency patterns (single handshake per multi-file session,
+       secret reuse across a whole transfer, large 256 KiB chunks, batched /
+       per-file acknowledgment instead of per-chunk acknowledgment).
+
+   MIT License text (as published by the upstream project):
+
+     Permission is hereby granted, free of charge, to any person obtaining a
+     copy of this software and associated documentation files (the
+     "Software"), to deal in the Software without restriction, including
+     without limitation the rights to use, copy, modify, merge, publish,
+     distribute, sublicense, and/or sell copies of the Software, and to
+     permit persons to whom the Software is furnished to do so, subject to
+     the following conditions:
+
+     The above copyright notice and this permission notice shall be included
+     in all copies or substantial portions of the Software.
+
+     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+     OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+     MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+     IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+     CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+     TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+     SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+2. nearby-sharing/android — Windows Nearby Sharing / MS-CDP reference
+--------------------------------------------------------------------------------
+   Project   : nearby-sharing (android client)
+   Homepage  : https://github.com/nearby-sharing/android
+   License   : Apache License 2.0 (as published in the project's LICENSE file)
+
+   Used as the reference for:
+     - the Microsoft Co-Discovery Protocol (MS-CDP) discovery beacon broadcast
+       as BLE manufacturer data under Microsoft company id 0x0006, with the
+       fixed-layout `BLeBeacon` (`[scenario=1][deviceType][version<<5|flags]
+       [deviceStatus][mac6][deviceName]`) — the exact layout implemented by
+       `MsCdpHandler`;
+     - the NearShare control-message set (StartTransfer / FetchDataRequest /
+       FetchDataResponse / CompleteTransfer / CancelTransfer / handshake),
+       its pull-based 100 KiB partition flow, and the CDP session binary
+       framing.
+
+   Apache License 2.0 text is available at:
+     https://www.apache.org/licenses/LICENSE-2.0.txt
+   (also published in the upstream repository's LICENSE file).
+
+--------------------------------------------------------------------------------
+3. NearDrop (via Bada) — Quick Share PIN / key-derivation semantics
+--------------------------------------------------------------------------------
+   Project   : NearDrop (grishka/NearDrop) — referenced by Bada
+   Homepage  : https://github.com/grishka/NearDrop
+   License   : GPL v3 (as published in the upstream repository's LICENSE file)
+
+   The 4-digit Quick Share confirmation PIN implemented in this module
+   (`GsCrypto.pinFromBytes`) is the Chromium algorithm ported verbatim from
+   NearDrop's `pinCodeFromAuthKey` (mod 9973, multiplier 31, signed bytes,
+   `abs(hash)` formatted to 4 digits), as adopted by Bada's
+   `PinDerivation.deriveFourDigitPin`. The PIN seed is derived with
+   HKDF-SHA256 using Bada's "UKEY2 v1 auth" salt.
+
+--------------------------------------------------------------------------------
+Notes
+--------------------------------------------------------------------------------
+- This module is self-contained: it does not import the "entry"
+  module. All byte/crypto/transport utilities are re-implemented inside this
+  module so the GPL boundary stays clean.
+- The application shell accesses this module exclusively through
+  the facade exposed by `entry/src/main/ets/protocol/gs/` (GsFacade + factory
+  + adapter). No other entry source file imports gs internals.
+- Wire constants were verified against the upstream sources referenced above
+  (cloned and read at build time): the CDP beacon layout/scenario/device-type
+  values, the Microsoft company id 0x0006, and the Quick Share PIN algorithm.
+  The NearShare transport-layer exchange in this module is a self-consistent
+  simplified variant (length-prefixed JSON control frames); byte-exact
+  interop with stock Windows Nearby requires porting the full CDP binary
+  session protocol (ValueSet serialization, 100 KiB pull-based FetchData, CDP
+  encryption), which is documented at the definition site in
+  `NearShareProtocol.ets`. Likewise, the Quick Share data plane here uses the
+  task-frozen PBKDF2 + AES-256-GCM suite rather than the real Quick Share
+  HKDF + AES-256-CBC/HMAC-SHA256 SecureMessage suite; the PIN derivation
+  follows the reference algorithm exactly.

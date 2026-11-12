@@ -3,9 +3,9 @@ import fs from '@ohos.file.fs';
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { ByteUtils } from '../../common/ByteUtils';
+import { HttpBodyParser } from '../../common/HttpBodyParser';
 import { SecurityUtils } from '../../common/SecurityUtils';
 import { SettingsStore } from '../../common/SettingsStore';
-import { DeviceIdentity } from '../../common/DeviceIdentity';
 import { CertificateStore } from '../../common/CertificateStore';
 import { Transports } from '../../common/TlsTransport';
 import { LocalSendServer } from './LocalSendServer';
@@ -44,11 +44,6 @@ interface SenderInfoJson {
   version: string;
   discoverable: boolean;
   announce: boolean;
-}
-
-// 对端 /info 响应的局部视图：只需 download 字段判断其是否接收文件。
-interface PeerInfoJson {
-  download?: boolean;
 }
 
 interface FileInfoEntry {
@@ -92,6 +87,11 @@ const UPLOAD_TIMEOUT_MS = 900000;
 const INFO_STALL_MS = 6000;
 const UPLOAD_STALL_MS = 60000;
 const STALL_CHECK_MS = 2000;
+/**
+ * 「响应体长度未知」时，头部之后空闲多久算读完（我们发 `Connection: close`，对端响应完即关连接）。
+ * 真机上的对端（官方 LocalSend，Dart）对 JSON 响应一律 chunked，见 `readContentLength` 的注释。
+ */
+const IDLE_SETTLE_MS = 300;
 const SHA256_MAX_SIZE = 64 * 1024 * 1024;
 // v2 is the current/default LocalSend protocol (and what modern peers like 2.2 implement
 // for the send flow, e.g. /v2/prepare-upload). v1/legacy are fallbacks: some peers answer
@@ -99,20 +99,11 @@ const SHA256_MAX_SIZE = 64 * 1024 * 1024;
 // tried first — otherwise we pick v1 from the /info probe and then get 404 on the send path.
 const API_FAMILIES: string[] = ['/api/localsend/v2', '/api/localsend/v1', '/api'];
 const apiPrefixCache: Map<string, string> = new Map();
-const IMAGE_EXTENSIONS: string[] = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.heic', '.svg'];
-const VIDEO_EXTENSIONS: string[] = ['.mp4', '.mkv', '.mov', '.avi', '.webm', '.3gp'];
-const TEXT_EXTENSIONS: string[] = ['.txt', '.md', '.json', '.csv', '.xml', '.html', '.log'];
 
 export class LocalSendClient {
 
   private readonly context: common.Context;
   private readonly certs: CertificateStore;
-  // 对端 /info 是否宣告可接收文件(download)。LocalSend 对端关闭“接收”时返回
-  // download:false。实践发现该字段并不可靠：某些对端(如"善良的葡萄" v2.2)返回
-  // download:false 但仍能正常接收(其他 LocalSend 客户端可向其发送成功)。因此这里
-  // 只做提示、不 fail-fast，让传输按真实对端响应推进，避免误拦一个能接收的对端。
-  private peerCanReceive: boolean = true;
-
   constructor(context: common.Context) {
     this.context = context;
     this.certs = new CertificateStore(context);
@@ -126,23 +117,17 @@ export class LocalSendClient {
     Lg.i('LocalSend send: peer=' + device.address + ':' + device.port
       + ' https=' + device.https + ' files=' + files.length + ' totalBytes=' + totalBytes);
     const apiPrefix = await this.probeApiPrefix(device);
-    if (!this.peerCanReceive) {
-      // 对端宣告 download:false，但它可能仍能接收(该字段在部分对端上不可靠)。只提示，
-      // 继续走 prepare-upload → upload 实际流程：若对端真的不接收，会由超时/响应自然暴露。
-      Lg.w('LocalSend send: peer /info 返回 download:false，但仍继续尝试发送'
-        + '(该字段在部分对端上不可靠)。若对端确不接收会按超时失败。');
-    }
     const fileEntries: Record<string, FileInfoEntry> = {};
-    const fileIds: Map<string, string> = new Map();
+    const fileIds: string[] = [];
     for (const file of files) {
       const fileId = SecurityUtils.createToken();
-      fileIds.set(file.path, fileId);
+      fileIds.push(fileId);
       const fileHash = await this.fileHash(file);
       const fileEntry: FileInfoEntry = {
         id: fileId,
         fileName: file.name,
         size: file.size,
-        fileType: LocalSendClient.toLocalSendFileType(file.name),
+        fileType: LocalSendClient.toLocalSendMimeType(file.name, file.mime),
         legacy: false,
         preview: ''
       };
@@ -230,7 +215,7 @@ export class LocalSendClient {
     let index = 0;
     for (const file of files) {
       index += 1;
-      const fileId = fileIds.get(file.path) ?? '';
+      const fileId = fileIds[index - 1];
       if (this.isSkipped(session, fileId)) {
         Lg.i('LocalSend send: ' + index + '/' + files.length + ' ' + file.name + ' skipped by peer (already exists)');
         transferred += file.size;
@@ -281,10 +266,6 @@ export class LocalSendClient {
       Lg.i('LocalSend send: probe ' + family + '/info -> status ' + info.status);
       if (info.status === 200) {
         apiPrefixCache.set(cacheKey, family);
-        const infoText = ByteUtils.decodeText(info.body);
-        Lg.i('LocalSend send: peer info body: ' + infoText.substring(0, 256));
-        // 对端若宣告 download:false，说明其当前不接收文件；立即标注，send() 据此 fail-fast。
-        this.peerCanReceive = LocalSendClient.parsePeerCanReceive(infoText);
         return family;
       }
       if (info.status === 0) {
@@ -316,14 +297,14 @@ export class LocalSendClient {
 
   private async senderInfo(): Promise<SenderInfoJson> {
     const alias = SettingsStore.current().alias;
-    const certFingerprint = await this.certs.fingerprint();
+    const https = LocalSendServer.lastHttpsActive;
     return {
       alias: alias,
       deviceModel: 'HarmonyOS NEXT',
       deviceType: 'mobile',
-      fingerprint: certFingerprint.length > 0 ? certFingerprint : await DeviceIdentity.load(this.context),
-      port: 53317,
-      protocol: 'http',
+      fingerprint: await this.certs.discoveryFingerprint(https),
+      port: LocalSendServer.actualPort || 53317,
+      protocol: https ? 'https' : 'http',
       download: false,
       version: '2.0',
       discoverable: true,
@@ -366,47 +347,103 @@ export class LocalSendClient {
     return false;
   }
 
-  private static toLocalSendFileType(name: string): string {
-    const lower = name.toLowerCase();
-    if (LocalSendClient.endsWithAny(lower, IMAGE_EXTENSIONS)) {
-      return 'image';
+  private static toLocalSendMimeType(name: string, providedMime: string): string {
+    const normalizedMime = LocalSendClient.normalizeMimeType(providedMime);
+    if (normalizedMime.length > 0) {
+      return normalizedMime;
     }
-    if (LocalSendClient.endsWithAny(lower, VIDEO_EXTENSIONS)) {
-      return 'video';
+
+    const lower = name.toLowerCase();
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.jpe') || lower.endsWith('.jfif')) {
+      return 'image/jpeg';
+    }
+    if (lower.endsWith('.png')) {
+      return 'image/png';
+    }
+    if (lower.endsWith('.gif')) {
+      return 'image/gif';
+    }
+    if (lower.endsWith('.webp')) {
+      return 'image/webp';
+    }
+    if (lower.endsWith('.bmp')) {
+      return 'image/bmp';
+    }
+    if (lower.endsWith('.heic')) {
+      return 'image/heic';
+    }
+    if (lower.endsWith('.heif')) {
+      return 'image/heif';
+    }
+    if (lower.endsWith('.avif')) {
+      return 'image/avif';
+    }
+    if (lower.endsWith('.svg')) {
+      return 'image/svg+xml';
+    }
+    if (lower.endsWith('.tif') || lower.endsWith('.tiff')) {
+      return 'image/tiff';
+    }
+    if (lower.endsWith('.dng')) {
+      return 'image/x-adobe-dng';
+    }
+    if (lower.endsWith('.mp4')) {
+      return 'video/mp4';
+    }
+    if (lower.endsWith('.mkv')) {
+      return 'video/x-matroska';
+    }
+    if (lower.endsWith('.mov')) {
+      return 'video/quicktime';
+    }
+    if (lower.endsWith('.avi')) {
+      return 'video/x-msvideo';
+    }
+    if (lower.endsWith('.webm')) {
+      return 'video/webm';
+    }
+    if (lower.endsWith('.3gp')) {
+      return 'video/3gpp';
     }
     if (lower.endsWith('.pdf')) {
-      return 'pdf';
+      return 'application/pdf';
     }
-    if (LocalSendClient.endsWithAny(lower, TEXT_EXTENSIONS)) {
-      return 'text';
+    if (lower.endsWith('.txt') || lower.endsWith('.log')) {
+      return 'text/plain';
+    }
+    if (lower.endsWith('.md')) {
+      return 'text/markdown';
+    }
+    if (lower.endsWith('.json')) {
+      return 'application/json';
+    }
+    if (lower.endsWith('.csv')) {
+      return 'text/csv';
+    }
+    if (lower.endsWith('.xml')) {
+      return 'application/xml';
+    }
+    if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+      return 'text/html';
     }
     if (lower.endsWith('.apk')) {
-      return 'apk';
+      return 'application/vnd.android.package-archive';
     }
-    return 'other';
+    return 'application/octet-stream';
   }
 
-  private static endsWithAny(name: string, extensions: string[]): boolean {
-    for (const extension of extensions) {
-      if (name.endsWith(extension)) {
-        return true;
-      }
+  private static normalizeMimeType(mime: string): string {
+    const lower = mime.trim().toLowerCase();
+    const separator = lower.indexOf(';');
+    const normalized = separator >= 0 ? lower.substring(0, separator).trim() : lower;
+    const slash = normalized.indexOf('/');
+    if (slash <= 0 || slash === normalized.length - 1 || normalized.endsWith('/*')) {
+      return '';
     }
-    return false;
-  }
-
-  /**
-   * 解析对端 /info 响应中的 download 字段。
-   * download 缺失或解析失败时按“可接收”处理(默认 true)，避免误拦正常对端。
-   * 仅当对端明确返回 download:false 才判定为不接收。
-   */
-  private static parsePeerCanReceive(infoText: string): boolean {
-    try {
-      const parsed = JSON.parse(infoText) as PeerInfoJson;
-      return parsed.download !== false;
-    } catch (error) {
-      return true;
+    if (normalized === 'application/octet-stream' || normalized === 'binary/octet-stream') {
+      return '';
     }
+    return normalized;
   }
 
   private async uploadFile(
@@ -542,6 +579,9 @@ export class LocalSendClient {
       }
     }
     const transport = await Transports.open(device.address, device.port, device.https, certPem, keyPem);
+    let timer = -1;
+    let idleTimer = -1;
+    let stallTimer = -1;
     try {
       const timeoutMs = options.timeoutMs !== undefined ? options.timeoutMs : REQUEST_TIMEOUT_MS;
       const framing = options.chunked === true
@@ -557,8 +597,11 @@ export class LocalSendClient {
       let bodySent = options.writeBody === undefined;
       let lastDataAt = Date.now();
       let resolver: ((response: ParsedResponse) => void) | undefined = undefined;
-      let timer = -1;
-      let stallTimer = -1;
+      let headParsed = false;
+      let status = 0;
+      // -1 = 响应头里没有 Content-Length（真正的长度未知，绝不能当成 0）。
+      let contentLength = -1;
+      let chunked = false;
       const settle = (response: ParsedResponse): void => {
         if (settled) {
           return;
@@ -570,9 +613,30 @@ export class LocalSendClient {
         if (stallTimer !== -1) {
           clearInterval(stallTimer);
         }
+        if (idleTimer !== -1) {
+          clearTimeout(idleTimer);
+          idleTimer = -1;
+        }
         if (resolver !== undefined) {
           resolver(response);
         }
+      };
+      /** 「长度未知」的响应：头解析完后再等这么久的空闲就当作读完（LAN 上毫秒级）。 */
+      const restartIdleTimer = (): void => {
+        if (idleTimer !== -1) {
+          clearTimeout(idleTimer);
+        }
+        idleTimer = setTimeout((): void => {
+          idleTimer = -1;
+          if (settled) {
+            return;
+          }
+          const headerEnd = ByteUtils.indexOf(buffer, CRLF_CRLF, 0);
+          const body = headerEnd < 0 ? new Uint8Array(0) : buffer.slice(headerEnd + 4);
+          settle({ status: status, body: chunked
+            ? (HttpBodyParser.decodeChunked(body) ?? body)
+            : body });
+        }, IDLE_SETTLE_MS);
       };
       timer = setTimeout((): void => {
         Lg.w('LocalSend request timeout: ' + options.method + ' ' + options.path + ' after ' + timeoutMs + ' ms');
@@ -597,65 +661,82 @@ export class LocalSendClient {
         if (headerEnd < 0) {
           return;
         }
-        const headText = ByteUtils.decodeText(buffer.slice(0, headerEnd));
-        const contentLength = LocalSendClient.readContentLength(headText);
-        const bodyStart = headerEnd + 4;
-        if (buffer.length >= bodyStart + contentLength) {
-          settle({
-            status: LocalSendClient.readStatus(headText),
-            body: buffer.slice(bodyStart, bodyStart + contentLength)
-          });
+        if (!headParsed) {
+          const headText = ByteUtils.decodeText(buffer.slice(0, headerEnd));
+          const head = HttpBodyParser.parseHead(headText);
+          status = head.status;
+          contentLength = head.contentLength;
+          chunked = head.chunked;
+          headParsed = true;
         }
+        const body = buffer.slice(headerEnd + 4);
+        if (chunked) {
+          const decoded = HttpBodyParser.decodeChunked(body);
+          if (decoded !== undefined) {
+            settle({ status: status, body: decoded });
+          }
+          return;
+        }
+        if (contentLength >= 0) {
+          if (body.length >= contentLength) {
+            settle({ status: status, body: body.slice(0, contentLength) });
+          }
+          return;
+        }
+        // 既没有 Content-Length 也不是 chunked：按「读到连接关闭为止」处理。传输层没有 close 回调，
+        // 就用一小段空闲时间当读完（我们发的是 `Connection: close`，对端响应完就会关）。
+        restartIdleTimer();
       });
-      await transport.send(ByteUtils.encodeText(head));
-      if (options.writeBody !== undefined) {
-        try {
-          if (options.chunked === true) {
-            const sendFrame = async (chunk: Uint8Array): Promise<void> => {
-              if (chunk.length === 0) {
-                return;
-              }
-              await transport.send(ByteUtils.encodeText(chunk.length.toString(16)));
-              await transport.send(CRLF);
-              await transport.send(chunk);
-              await transport.send(CRLF);
-            };
-            await options.writeBody(sendFrame);
-            await transport.send(FINAL_CHUNK);
-          } else {
-            await options.writeBody((chunk: Uint8Array): Promise<void> => transport.send(chunk));
-          }
-          bodySent = true;
-          lastDataAt = Date.now();
-        } catch (error) {
-          if (!settled) {
-            throw error as Error;
-          }
-          Lg.w('LocalSend upload: peer responded before body finished (' + options.method + ' ' + options.path + ')');
+      const sendChunk = async (chunk: Uint8Array): Promise<void> => {
+        if (settled) {
+          throw new Error('LocalSend request already completed or timed out');
         }
-      }
-      return await completion;
+        await transport.send(chunk);
+      };
+      const upload = async (): Promise<void> => {
+        await sendChunk(ByteUtils.encodeText(head));
+        if (options.writeBody !== undefined) {
+          try {
+            if (options.chunked === true) {
+              const sendFrame = async (chunk: Uint8Array): Promise<void> => {
+                if (chunk.length === 0) {
+                  return;
+                }
+                await sendChunk(ByteUtils.encodeText(chunk.length.toString(16)));
+                await sendChunk(CRLF);
+                await sendChunk(chunk);
+                await sendChunk(CRLF);
+              };
+              await options.writeBody(sendFrame);
+              await sendChunk(FINAL_CHUNK);
+            } else {
+              await options.writeBody((chunk: Uint8Array): Promise<void> => sendChunk(chunk));
+            }
+            bodySent = true;
+            lastDataAt = Date.now();
+          } catch (error) {
+            if (!settled) {
+              throw error as Error;
+            }
+            Lg.w('LocalSend upload: peer responded before body finished (' + options.method + ' ' + options.path + ')');
+          }
+        }
+      };
+      // An HTTP result/deadline can arrive while send/writeBody is still pending.
+      // Racing the whole upload lets finally close the transport and release timers.
+      return await Promise.race([upload().then((): Promise<ParsedResponse> => completion), completion]);
     } finally {
+      if (timer !== -1) {
+        clearTimeout(timer);
+      }
+      if (idleTimer !== -1) {
+        clearTimeout(idleTimer);
+      }
+      if (stallTimer !== -1) {
+        clearInterval(stallTimer);
+      }
       await transport.close();
     }
-  }
-
-  private static readStatus(headText: string): number {
-    const firstLine = headText.split('\r\n')[0] ?? '';
-    const parts = firstLine.split(' ');
-    const value = parseInt(parts[1] ?? '0', 10);
-    return Number.isNaN(value) ? 0 : value;
-  }
-
-  private static readContentLength(headText: string): number {
-    const lines = headText.split('\r\n');
-    for (const line of lines) {
-      if (line.toLowerCase().startsWith('content-length:')) {
-        const value = parseInt(line.substring(15).trim(), 10);
-        return Number.isNaN(value) ? 0 : value;
-      }
-    }
-    return 0;
   }
 
   static errorCode(error: BusinessError): string {

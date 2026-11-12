@@ -12,7 +12,6 @@ import { LogCapture as Lg } from '../common/LogCapture';
  */
 
 import { socket } from '@kit.NetworkKit';
-import { fileUri, picker } from '@kit.CoreFileKit';
 import bluetoothSocket from '@ohos.bluetooth.socket';
 import netConnection from '@ohos.net.connection';
 import fs from '@ohos.file.fs';
@@ -58,6 +57,7 @@ import {
 } from '../protocol/windowsnearby/CdpConnection';
 import { CdpValueSet } from '../protocol/windowsnearby/CdpBond';
 import { SettingsStore } from '../common/SettingsStore';
+import { GalleryMediaClassifier } from '../quickshare/storage/GalleryMediaClassifier';
 
 const LOG_TAG = '羊绒互传 WindowsNearbyTransfer';
 const APP_HANDSHAKE_ID = '0d472c30-80b5-4722-a279-0f3b97f0dcf2';
@@ -85,13 +85,21 @@ export class WindowsNearbyTransferListener {
     return Promise.resolve(false);
   }
 
-  onFileReceived(file: WindowsNearbyIncomingFile, savedPath: string): void {
+  /**
+   * 异步：入口层必须先完成动态照片/图库保存或 Download 回退，
+   * 后续文件与 Completed 状态才不会抢在最终路径确定前发出。
+   */
+  onFileReceived(file: WindowsNearbyIncomingFile, savedPath: string): Promise<void> {
+    return Promise.resolve();
   }
 
   onProgress(percent: number): void {
   }
 
   onCompleted(): void {
+  }
+
+  onFailed(reason: string): void {
   }
 }
 
@@ -100,7 +108,8 @@ interface PendingFile {
   readonly name: string;
   readonly size: number;
   readonly path: string;
-  readonly fd: number;
+  fd: number;
+  complete: boolean;
 }
 
 interface FunctionalChannel {
@@ -159,9 +168,15 @@ export class WindowsNearbyTransfer {
   private accepted = false;
   private currentMessageId: number = 0;
   private waitResponse?: (payload: CdpValueSet) => void;
+  private responseReject?: (error: Error) => void;
+  private responseTimer: number = -1;
   private finished = false;
+  private networkDone = false;
+  private deviceAuthenticated = false;
   /** 已完成/中止的会话计数，用于诊断「第二次搜不到」类问题。 */
   private sessionCount: number = 0;
+  private sessionGeneration: number = 0;
+  private lifecycleGeneration: number = 0;
   /** CDP-level fragment reassembly: key = header.sequenceNumber, value = fragmentIndex -> payload. */
   private readonly fragMap: Map<number, Map<number, Uint8Array>> = new Map<number, Map<number, Uint8Array>>();
 
@@ -180,14 +195,25 @@ export class WindowsNearbyTransfer {
     return this.running;
   }
 
+  captureSessionValidity(): () => boolean {
+    const generation = this.sessionGeneration;
+    return (): boolean => this.running && !this.finished && generation === this.sessionGeneration;
+  }
+
   async start(): Promise<void> {
     if (this.running) {
       return;
     }
     this.running = true;
+    const generation = ++this.lifecycleGeneration;
     Lg.i(LOG_TAG + ': receiver start (TCP ' + CDP_TCP_PORT + ', UDP ' + CDP_UDP_PORT + ')');
     const server = socket.constructTCPSocketServerInstance();
+    this.server = server;
     server.on('connect', (conn: socket.TCPSocketConnection): void => {
+      if (!this.running || generation !== this.lifecycleGeneration) {
+        conn.close().catch((): void => undefined);
+        return;
+      }
       if (this.upgradingToTcp) {
         // This is the RFCOMM -> TCP upgrade target. Attach it as the session
         // socket but keep routing on Bluetooth until TransportRequest finalises
@@ -198,9 +224,11 @@ export class WindowsNearbyTransfer {
         this.fragMap.clear();
         Lg.i(LOG_TAG + ': upgrade TCP connected');
         conn.on('message', (info: socket.SocketMessageInfo): void => {
+          if (this.conn !== conn) { return; }
           this.onData(new Uint8Array(info.message));
         });
         conn.on('close', (): void => {
+          if (this.conn !== conn) { return; }
           Lg.i(LOG_TAG + ': upgrade TCP closed');
           // 升级连接在 TransportRequest 之前断开（升级失败/会话中止）：解除卡死的
           // upgradingToTcp，否则下一次 Windows 会话的 TCP 连接会被误判为升级目标，
@@ -208,34 +236,49 @@ export class WindowsNearbyTransfer {
           this.upgradingToTcp = false;
         });
         conn.on('error', (error: BusinessError): void => {
+          if (this.conn !== conn) { return; }
           Lg.w(LOG_TAG + ': upgrade TCP error: ' + JSON.stringify(error));
           this.upgradingToTcp = false;
         });
         return;
       }
+      if (!this.finished && (this.accepted || this.pendingIncoming.length > 0)) {
+        conn.close().catch((): void => undefined);
+        return;
+      }
       Lg.i(LOG_TAG + ': TCP client connected');
       this.listener.onStatus('Windows 正尝试建立 CDP 连接');
-      this.conn = conn;
-      this.buffer = new Uint8Array(0);
       // 新会话：清空上一会话残留（cryptor/序号/频道/待收文件等），避免第二次传输错乱。
       this.resetSession();
+      const previous = this.conn;
+      this.conn = conn;
+      previous?.close().catch((): void => undefined);
+      this.buffer = new Uint8Array(0);
       this.useBt = false;
       this.upgradingToTcp = false;
       this.sessionCount++;
       Lg.i(LOG_TAG + ': session #' + this.sessionCount + ' start (transport=TCP)');
       conn.on('message', (info: socket.SocketMessageInfo): void => {
+        if (this.conn !== conn) { return; }
         this.onData(new Uint8Array(info.message));
       });
       conn.on('close', (): void => {
+        if (this.conn !== conn) { return; }
         this.listener.onStatus('Windows CDP 连接已关闭');
+        if (!this.networkDone) { this.abortTransfer('Windows 对端连接已断开'); }
       });
       conn.on('error', (error: BusinessError): void => {
+        if (this.conn !== conn) { return; }
         this.listener.onStatus('Windows CDP 连接错误：' + JSON.stringify(error));
+        if (!this.networkDone) { this.abortTransfer('Windows 接收连接错误'); }
       });
     });
     try {
       await server.listen({ address: '0.0.0.0', family: 1, port: CDP_TCP_PORT });
-      this.server = server;
+      if (!this.running || generation !== this.lifecycleGeneration) {
+        await server.close().catch((): void => undefined);
+        return;
+      }
       Lg.i(LOG_TAG + ': TCP ' + CDP_TCP_PORT + ' listening');
       this.listener.onStatus('已监听 Windows CDP TCP ' + CDP_TCP_PORT);
     } catch (error) {
@@ -246,11 +289,17 @@ export class WindowsNearbyTransfer {
       Lg.w(LOG_TAG + ': TCP listen failed, degrade to UDP discovery + Bluetooth: ' + JSON.stringify(error));
       this.listener.onStatus('Windows CDP TCP ' + CDP_TCP_PORT + ' 监听失败，降级为蓝牙接收');
     }
+    if (!this.running || generation !== this.lifecycleGeneration) {
+      await server.close().catch((): void => undefined);
+      return;
+    }
     this.startUdpDiscovery();
     this.startBluetoothListener();
   }
 
   stop(): void {
+    this.lifecycleGeneration += 1;
+    this.abortTransfer('Windows 接收服务已停止');
     this.running = false;
     if (this.btServerSocket >= 0) {
       try {
@@ -307,12 +356,17 @@ export class WindowsNearbyTransfer {
         Lg.w(LOG_TAG + ': udp close failed: ' + JSON.stringify(error));
       }
     }
+    const conn = this.conn;
     this.conn = undefined;
+    conn?.close().catch((): void => undefined);
   }
 
   private startUdpDiscovery(): void {
+    const generation = this.lifecycleGeneration;
     const udp = socket.constructUDPSocketInstance();
+    this.udp = udp;
     udp.on('message', (value: socket.SocketMessageInfo): void => {
+      if (!this.running || generation !== this.lifecycleGeneration || this.udp !== udp) { return; }
       const bytes = new Uint8Array(value.message);
       const discoveryType = bytes.length > 42 ? bytes[42] : -1;
       if (this.ownIp.length > 0 && value.remoteInfo.address === this.ownIp) {
@@ -344,10 +398,17 @@ export class WindowsNearbyTransfer {
       }
     });
     udp.bind({ address: '0.0.0.0', port: CDP_UDP_PORT, family: 1 }).then(async (): Promise<void> => {
-      this.udp = udp;
+      if (!this.running || generation !== this.lifecycleGeneration || this.udp !== udp) {
+        await udp.close().catch((): void => undefined);
+        return;
+      }
       Lg.i(LOG_TAG + ': UDP ' + CDP_UDP_PORT + ' bound (discover + advertise)');
       const extraOptions: socket.UDPExtraOptions = { broadcast: true, reuseAddress: true };
       await udp.setExtraOptions(extraOptions);
+      if (!this.running || generation !== this.lifecycleGeneration || this.udp !== udp) {
+        await udp.close().catch((): void => undefined);
+        return;
+      }
       const request = buildPresenceRequestFrame();
       const sentTargets: Set<string> = new Set<string>();
       this.refreshBroadcastTargets();
@@ -375,7 +436,8 @@ export class WindowsNearbyTransfer {
       }, 10000);
     }).catch((error: BusinessError): void => {
       Lg.w(LOG_TAG + ': udp bind failed: ' + JSON.stringify(error));
-      this.udp = undefined;
+      udp.close().catch((): void => undefined);
+      if (this.udp === udp) { this.udp = undefined; }
     });
   }
 
@@ -434,6 +496,7 @@ export class WindowsNearbyTransfer {
   }
 
   private onData(chunk: Uint8Array): void {
+    const generation = this.sessionGeneration;
     this.buffer = ByteUtils.concat([this.buffer, chunk]);
     while (this.buffer.length >= 4) {
       const messageLength = CdpCommonHeader.readRawMessageLength(this.buffer);
@@ -449,24 +512,29 @@ export class WindowsNearbyTransfer {
       try {
         const header = parseCommonHeaderSafe(frame);
         this.processFrame(frame, header).catch((error: Error): void => {
+          if (generation !== this.sessionGeneration) { return; }
           Lg.w(LOG_TAG + ': CDP process error: ' + error.message);
           this.listener.onStatus('CDP 处理失败：' + error.message);
+          this.abortTransfer(error.message);
         });
       } catch (error) {
         const msg = error instanceof Error ? error.message : JSON.stringify(error);
         Lg.w(LOG_TAG + ': CDP frame parse error: ' + msg);
         this.listener.onStatus('CDP 帧解析失败：' + msg);
+        this.abortTransfer(msg);
       }
     }
   }
 
   private async processFrame(frame: Uint8Array, header: CdpCommonHeader): Promise<void> {
+    const generation = this.sessionGeneration;
     let payload: Uint8Array;
     if (header.hasFlag(CdpMessageFlags.SessionEncrypted) && this.cryptor !== undefined) {
       payload = await this.cryptor.decryptFrame(frame, header);
     } else {
       payload = frame.slice(header.calcSize());
     }
+    this.assertSession(generation);
 
     // Normalise the session id before routing (CorrectClientSessionBit).
     header.correctClientSessionBit();
@@ -475,8 +543,9 @@ export class WindowsNearbyTransfer {
       await this.handleConnect(header, payload);
       return;
     }
-    if (this.cryptor === undefined) {
-      throw new Error('CDP session not encrypted');
+    if (this.cryptor === undefined || !this.deviceAuthenticated
+      || !header.hasFlag(CdpMessageFlags.SessionEncrypted) || !header.hasFlag(CdpMessageFlags.HasHMAC)) {
+      throw new Error('CDP 会话消息缺少认证或完整性校验');
     }
     if (header.type === CdpMessageType.Control) {
       await this.handleControl(header, payload);
@@ -603,6 +672,8 @@ export class WindowsNearbyTransfer {
   }
 
   private async handleConnectRequest(header: CdpCommonHeader, reader: CdpReader): Promise<void> {
+    const generation = this.sessionGeneration;
+    if (this.cryptor !== undefined) { throw new Error('CDP duplicate ConnectRequest'); }
     const request = CdpConnectionRequest.parse(reader);
     Lg.i(LOG_TAG + ': received ConnectRequest');
     this.remoteNonce = request.nonceBytes;
@@ -612,7 +683,9 @@ export class WindowsNearbyTransfer {
     this.localSessionHi = this.nextHostSessionId++;
     this.localSessionLo = clientLo;
 
-    this.localNonce = await randomBytes(8);
+    const nonce = await randomBytes(8);
+    this.assertSession(generation);
+    this.localNonce = nonce;
 
     const security = this.security;
     const point = security.publicPoint;
@@ -624,25 +697,27 @@ export class WindowsNearbyTransfer {
     response.publicKeyX = point.x;
     response.publicKeyY = point.y;
     await this.sendConnection(header, CdpConnectionType.ConnectResponse, response);
+    this.assertSession(generation);
 
     const secret = await security.deriveSharedSecret(request.publicKeyX, request.publicKeyY);
+    this.assertSession(generation);
     this.cryptor = CdpSecurity.createCryptor(secret);
     Lg.i(LOG_TAG + ': session cryptor established');
     this.listener.onStatus('CDP 握手：会话加密已建立');
   }
 
   private async handleDeviceAuth(header: CdpCommonHeader, reader: CdpReader, connectionType: number): Promise<void> {
+    const generation = this.sessionGeneration;
     if (this.cryptor === undefined) {
       throw new Error('CDP auth before encryption');
     }
     const payload = CdpAuthenticationPayload.parse(reader);
     Lg.i(LOG_TAG + ': received DeviceAuth');
     const ok = await this.security.verifyThumbprint(payload.certificate, payload.signedThumbprint, this.localNonce, this.remoteNonce);
+    this.assertSession(generation);
     Lg.i(LOG_TAG + ': DeviceAuth verify=' + ok);
-    if (!ok) {
-      this.listener.onStatus('CDP 认证失败：证书签名校验不通过');
-      return;
-    }
+    if (!ok) { throw new Error('CDP 认证失败：证书签名校验不通过'); }
+    this.deviceAuthenticated = true;
     const responseType = connectionType === CdpConnectionType.DeviceAuthRequest
       ? CdpConnectionType.DeviceAuthResponse
       : CdpConnectionType.UserDeviceAuthResponse;
@@ -650,6 +725,7 @@ export class WindowsNearbyTransfer {
       const authResponse = new CdpAuthenticationPayload();
       authResponse.certificate = this.security.certificateDer;
       authResponse.signedThumbprint = await this.security.signThumbprint(this.localNonce, this.remoteNonce);
+      this.assertSession(generation);
       await this.sendConnection(header, responseType, authResponse);
       this.listener.onStatus('CDP 认证：设备证书已完成交换');
       Lg.i(LOG_TAG + ': sent ' + (responseType === CdpConnectionType.DeviceAuthResponse ? 'DeviceAuthResponse' : 'UserDeviceAuthResponse'));
@@ -660,6 +736,7 @@ export class WindowsNearbyTransfer {
 
   private handleAuthDone(header: CdpCommonHeader): void {
     Lg.i(LOG_TAG + ': received AuthDoneRequest (over ' + (this.useBt ? 'BT' : 'TCP') + ')');
+    if (!this.deviceAuthenticated) { throw new Error('CDP 设备尚未认证'); }
     const result = new CdpResultPayload(CdpResult.Success);
     this.sendConnection(header, CdpConnectionType.AuthDoneRespone, result).catch((error: Error): void => {
       this.listener.onStatus('AuthDone 响应失败：' + error.message);
@@ -753,81 +830,72 @@ export class WindowsNearbyTransfer {
       this.resolveResponse(payload);
       return;
     }
-    if (control === 2) { // CompleteTransfer
-      this.finishTransfer();
-      return;
+    if (control === 5 && !this.networkDone) { // CancelTransfer
+      this.abortTransfer('Windows 对端取消了传输');
     }
   }
 
   private async handleStartTransfer(payload: CdpValueSet): Promise<void> {
+    if (this.pendingIncoming.length > 0 || this.accepted) { return; }
+    const generation = this.sessionGeneration;
     const bytesToSend = payload.getUInt64('BytesToSend');
     const fileNames = payload.getStringArray('FileNames');
     const contentIds = payload.getUInt32Array('ContentIds');
     const contentSizes = payload.getUInt64Array('ContentSizes');
     Lg.i(LOG_TAG + ': received StartTransfer from "' + this.peerName + '" bytes=' + bytesToSend
       + ' files=' + fileNames.length + ' names=' + fileNames.join(','));
+    if (fileNames.length === 0 || contentSizes.length !== fileNames.length) {
+      throw new Error('Windows 传输请求缺少文件或大小');
+    }
     const files: WindowsNearbyIncomingFile[] = [];
+    const seenIds: Set<number> = new Set<number>();
+    let total = 0;
     for (let i = 0; i < fileNames.length; i++) {
       const id = i < contentIds.length ? contentIds[i] : i;
-      const size = i < contentSizes.length ? contentSizes[i] : 0;
+      const size = contentSizes[i];
+      if (seenIds.has(id) || !Number.isSafeInteger(size) || size < 0 || !Number.isSafeInteger(total + size)) {
+        throw new Error('Windows 传输请求含有重复编号或无效大小');
+      }
+      seenIds.add(id);
+      total += size;
       files.push({ name: fileNames[i], size, contentId: id });
     }
     this.pendingIncoming = files;
-    this.bytesToSend = bytesToSend;
+    this.bytesToSend = total;
     this.bytesReceived = 0;
-    this.accepted = await this.listener.onIncomingTransfer(this.peerName, files);
+    const accepted = await this.listener.onIncomingTransfer(this.peerName, files);
+    this.assertSession(generation);
+    this.accepted = accepted;
     Lg.i(LOG_TAG + ': onIncomingTransfer accepted=' + this.accepted);
     if (!this.accepted) {
       const cancel = new CdpValueSet();
       cancel.addUInt32('ControlMessage', 5);
+      this.pendingIncoming = [];
       await this.sendValueSet(cancel, 11);
       return;
     }
-    await this.openFiles(files);
+    this.openFiles(files);
+    this.assertSession(generation);
     this.listener.onStatus('已接收 ' + files.length + ' 个文件，开始拉取数据');
     await this.pullNextFile();
   }
 
-  private async openFiles(files: WindowsNearbyIncomingFile[]): Promise<void> {
-    // 与 Quick Share 接收端一致的公共下载目录方案（对齐 gsproto QuickShareChannel.receiveFile）：
-    // DocumentViewPicker 的 DOWNLOAD 模式 + newFileNames 会返回 Download/<包名> 目录的授权
-    // URI（文件夹由系统创建，无需 WRITE_MEDIA 权限），经 fileUri 转真实路径后在其下写文件，
-    // 文件管理器可见。选择器不可用（如后台接收/无界面）时回退到应用沙箱。
-    for (const file of files) {
-      const safe = file.name.replace(/[\\/:*?"<>|]/g, '_');
-      let path = this.context.filesDir + '/incoming/windowsnearby/' + safe;
-      let fd = -1;
-      try {
-        const options: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
-        options.pickerMode = picker.DocumentPickerMode.DOWNLOAD;
-        options.newFileNames = [safe];
-        const documentViewPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(this.context);
-        const uris: string[] = await documentViewPicker.save(options);
-        if (uris.length === 0) {
-          throw new Error('picker returned no uri');
-        }
-        const basePath: string = new fileUri.FileUri(uris[0]).path;
-        path = basePath.endsWith('/') ? basePath + safe : basePath + '/' + safe;
-        fd = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC).fd;
-      } catch (error) {
-        Lg.w(LOG_TAG + ': public download dir unavailable, fallback to sandbox: ' + JSON.stringify(error));
-        const dir = this.context.filesDir + '/incoming/windowsnearby';
-        if (!fs.accessSync(dir)) {
-          fs.mkdirSync(dir, true);
-        }
-        path = dir + '/' + safe;
-        fd = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC).fd;
-      }
-      this.pendingFiles.push({ contentId: file.contentId, name: file.name, size: file.size, path, fd });
+  private openFiles(files: WindowsNearbyIncomingFile[]): void {
+    const dir = this.context.filesDir + '/incoming/windowsnearby';
+    if (!fs.accessSync(dir)) { fs.mkdirSync(dir, true); }
+    const batchDir = fs.mkdtempSync(dir + '/batch-XXXXXX');
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index];
+      const path = batchDir + '/' + index + '-' + GalleryMediaClassifier.safeFileName(file.name);
+      const fd = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE).fd;
+      this.pendingFiles.push({ contentId: file.contentId, name: file.name, size: file.size, path, fd, complete: false });
     }
   }
 
   private async pullNextFile(): Promise<void> {
+    const generation = this.sessionGeneration;
     for (const file of this.pendingFiles) {
-      if (file.size === 0) {
-        this.listener.onFileReceived({ name: file.name, size: 0, contentId: file.contentId }, file.path);
-        continue;
-      }
+      this.assertSession(generation);
       let position = 0;
       while (position < file.size) {
         const length = Math.min(CDP_PARTITION_SIZE, file.size - position);
@@ -836,45 +904,63 @@ export class WindowsNearbyTransfer {
         request.addUInt64('BlobPosition', position);
         request.addUInt32('BlobSize', length);
         request.addUInt32('ContentId', file.contentId);
-        await this.sendValueSet(request, this.currentMessageId);
-        const response = await this.awaitResponse();
-        await this.writeResponse(file, response);
+        // 先注册响应等待器，避免高速对端在 send 完成前返回数据而丢失唤醒。
+        const pendingResponse = this.awaitResponse();
+        this.sendValueSet(request, this.currentMessageId).catch((error: Error): void => {
+          if (generation === this.sessionGeneration) { this.abortTransfer(error.message); }
+        });
+        const response = await pendingResponse;
+        this.assertSession(generation);
+        await this.writeResponse(file, response, position, length);
+        this.assertSession(generation);
+        if (this.finished) { throw new Error('Windows 接收会话已结束'); }
         position += length;
         this.bytesReceived += length;
-        this.listener.onProgress(this.bytesToSend === 0 ? 100 : Math.floor(this.bytesReceived * 100 / this.bytesToSend));
+        this.listener.onProgress(this.bytesToSend === 0 ? 99.9 : Math.min(99.9, this.bytesReceived * 100 / this.bytesToSend));
       }
-      this.listener.onFileReceived({ name: file.name, size: file.size, contentId: file.contentId }, file.path);
+      fs.closeSync(file.fd);
+      file.fd = -1;
+      file.complete = true;
     }
-    const complete = new CdpValueSet();
-    complete.addUInt32('ControlMessage', 2); // CompleteTransfer
-    await this.sendValueSet(complete, this.currentMessageId);
-    this.finishTransfer();
+    await this.finishTransfer(generation);
   }
 
-  private async writeResponse(file: PendingFile, response: CdpValueSet): Promise<void> {
+  private async writeResponse(file: PendingFile, response: CdpValueSet, expectedPosition: number,
+    expectedLength: number): Promise<void> {
     const position = response.getUInt64('BlobPosition');
     const blob = response.getUInt8Array('DataBlob');
+    if (response.getUInt32('ContentId') !== file.contentId || position !== expectedPosition
+      || blob.length !== expectedLength || position + blob.length > file.size) {
+      throw new Error('Windows 文件数据不完整或与请求不匹配');
+    }
     fs.lseek(file.fd, position, fs.WhenceType.SEEK_SET);
-    await fs.write(file.fd, ByteUtils.toArrayBuffer(blob));
+    const written: number = await fs.write(file.fd, ByteUtils.toArrayBuffer(blob));
+    if (written !== blob.length) {
+      throw new Error('接收文件写入不完整');
+    }
   }
 
-  private finishTransfer(): void {
-    if (this.finished) {
-      return;
+  private async finishTransfer(generation: number): Promise<void> {
+    this.assertSession(generation);
+    if (!this.accepted || this.bytesReceived !== this.bytesToSend
+      || this.pendingFiles.length !== this.pendingIncoming.length
+      || this.pendingFiles.some((file: PendingFile): boolean => !file.complete)) {
+      throw new Error('Windows 文件尚未完整接收');
     }
-    this.finished = true;
+    this.networkDone = true;
+    const complete = new CdpValueSet();
+    complete.addUInt32('ControlMessage', 2); // CompleteTransfer
+    try { await this.sendValueSet(complete, this.currentMessageId); }
+    catch (error) { Lg.w(LOG_TAG + ': 完成回执无法发送：' + String(error)); }
+
     for (const file of this.pendingFiles) {
-      try {
-        fs.closeSync(file.fd);
-      } catch (error) {
-        Lg.w(LOG_TAG + ': close file failed: ' + JSON.stringify(error));
-      }
+      this.assertSession(generation);
+      await this.listener.onFileReceived({ name: file.name, size: file.size, contentId: file.contentId }, file.path);
     }
+    this.assertSession(generation);
+    this.finished = true;
     this.pendingFiles = [];
     this.pendingIncoming = [];
-    // 会话结束后释放蓝牙客户端 socket：否则 handleBtClient() 会因残留的
-    // btClientSocket >= 0 守卫而关闭下一次连接（日志里的 “SppCloseClientSocket inner error”），
-    // 导致「一次成功后第二次无法发送」。
     this.releaseBtClient();
     this.listener.onStatus('Windows Nearby 已接收全部文件');
     this.listener.onCompleted();
@@ -886,6 +972,12 @@ export class WindowsNearbyTransfer {
    * 调用方随后按需设置 useBt / upgradingToTcp。
    */
   private resetSession(): void {
+    this.abortTransfer('Windows 接收会话已替换');
+    if (this.responseTimer !== -1) {
+      clearTimeout(this.responseTimer);
+      this.responseTimer = -1;
+    }
+    this.responseReject = undefined;
     // 上一会话异常中止时可能残留未关闭的文件句柄。
     for (const file of this.pendingFiles) {
       try {
@@ -895,6 +987,8 @@ export class WindowsNearbyTransfer {
       }
     }
     this.cryptor = undefined;
+    this.deviceAuthenticated = false;
+    this.networkDone = false;
     this.localNonce = new Uint8Array(8);
     this.remoteNonce = new Uint8Array(8);
     this.localSessionHi = 0;
@@ -999,8 +1093,10 @@ export class WindowsNearbyTransfer {
   }
 
   private async sendPayload(header: CdpCommonHeader, payload: Uint8Array): Promise<void> {
+    const generation = this.sessionGeneration;
     if (this.cryptor !== undefined) {
       const frame = await this.cryptor.encryptMessage(header, payload);
+      this.assertSession(generation);
       await this.writeToPeer(frame);
     } else {
       const writer = new CdpWriter();
@@ -1031,6 +1127,7 @@ export class WindowsNearbyTransfer {
   /** CDP Proximal Transport over Bluetooth RFCOMM (the transport Windows picks
    *  when it sees a Bluetooth-oriented BLE beacon). */
   private startBluetoothListener(): void {
+    const generation = this.lifecycleGeneration;
     try {
       bluetoothSocket.sppListen(
         'CDP Proximal Transport',
@@ -1038,6 +1135,10 @@ export class WindowsNearbyTransfer {
         (error: BusinessError, serverSocket: number): void => {
           if (error) {
             Lg.w(LOG_TAG + ': bt sppListen failed code=' + error.code + ', message=' + error.message);
+            return;
+          }
+          if (!this.running || generation !== this.lifecycleGeneration) {
+            try { bluetoothSocket.sppCloseServerSocket(serverSocket); } catch (_) {}
             return;
           }
           this.btServerSocket = serverSocket;
@@ -1055,9 +1156,15 @@ export class WindowsNearbyTransfer {
       return;
     }
     try {
-      bluetoothSocket.sppAccept(this.btServerSocket, (btError: BusinessError, clientSocket: number): void => {
+      const serverSocket = this.btServerSocket;
+      const generation = this.lifecycleGeneration;
+      bluetoothSocket.sppAccept(serverSocket, (btError: BusinessError, clientSocket: number): void => {
         if (btError) {
           Lg.w(LOG_TAG + ': bt sppAccept failed code=' + btError.code + ', message=' + btError.message);
+          return;
+        }
+        if (!this.running || generation !== this.lifecycleGeneration || this.btServerSocket !== serverSocket) {
+          try { bluetoothSocket.sppCloseClientSocket(clientSocket); } catch (_) {}
           return;
         }
         this.acceptBt();
@@ -1069,7 +1176,7 @@ export class WindowsNearbyTransfer {
   }
 
   private handleBtClient(clientSocket: number): void {
-    if (this.btClientSocket >= 0) {
+    if (this.btClientSocket >= 0 || (!this.finished && (this.accepted || this.pendingIncoming.length > 0))) {
       try {
         bluetoothSocket.sppCloseClientSocket(clientSocket);
       } catch (error) {
@@ -1077,24 +1184,31 @@ export class WindowsNearbyTransfer {
       }
       return;
     }
+    // 新会话：清空上一会话残留（cryptor/序号/频道/待收文件等），避免第二次传输错乱。
+    this.resetSession();
     this.btClientSocket = clientSocket;
     this.useBt = true;
     this.buffer = new Uint8Array(0);
-    // 新会话：清空上一会话残留（cryptor/序号/频道/待收文件等），避免第二次传输错乱。
-    this.resetSession();
     this.upgradingToTcp = false;
     this.sessionCount++;
     Lg.i(LOG_TAG + ': session #' + this.sessionCount + ' start (transport=BT)');
     this.listener.onStatus('Windows 正尝试通过蓝牙建立 CDP 连接');
     Lg.i(LOG_TAG + ': bt client connected, routing CDP');
     bluetoothSocket.on('sppRead', clientSocket, (data: ArrayBuffer): void => {
+      if (this.btClientSocket !== clientSocket) { return; }
       this.onData(new Uint8Array(data));
     });
   }
 
   private async awaitResponse(): Promise<CdpValueSet> {
-    return new Promise<CdpValueSet>((resolve: (value: CdpValueSet) => void): void => {
+    if (this.finished) { throw new Error('Windows 接收会话已结束'); }
+    return new Promise<CdpValueSet>((resolve: (value: CdpValueSet) => void, reject: (error: Error) => void): void => {
       this.waitResponse = resolve;
+      this.responseReject = reject;
+      this.responseTimer = setTimeout((): void => {
+        this.responseTimer = -1;
+        this.abortTransfer('Windows 文件数据等待超时');
+      }, 120000);
     });
   }
 
@@ -1102,7 +1216,49 @@ export class WindowsNearbyTransfer {
     if (this.waitResponse !== undefined) {
       const resolve = this.waitResponse;
       this.waitResponse = undefined;
+      this.responseReject = undefined;
+      if (this.responseTimer !== -1) {
+        clearTimeout(this.responseTimer);
+        this.responseTimer = -1;
+      }
       resolve(valueSet);
+    }
+  }
+
+  private abortTransfer(reason: string): void {
+    this.sessionGeneration += 1;
+    if (this.finished) { return; }
+    const hadTransfer = this.accepted || this.pendingFiles.length > 0 || this.pendingIncoming.length > 0;
+    this.finished = true;
+    this.accepted = false;
+    if (this.responseTimer !== -1) {
+      clearTimeout(this.responseTimer);
+      this.responseTimer = -1;
+    }
+    const reject: ((error: Error) => void) | undefined = this.responseReject;
+    this.responseReject = undefined;
+    this.waitResponse = undefined;
+    reject?.(new Error(reason));
+    for (const file of this.pendingFiles) {
+      if (file.fd >= 0) {
+        try { fs.closeSync(file.fd); } catch (error) { Lg.w(LOG_TAG + ': failed transfer close: ' + String(error)); }
+      }
+      if (!file.complete) {
+        try { fs.unlinkSync(file.path); } catch (error) { Lg.w(LOG_TAG + ': failed partial cleanup: ' + String(error)); }
+      }
+    }
+    this.pendingFiles = [];
+    this.pendingIncoming = [];
+    this.releaseBtClient();
+    if (hadTransfer) {
+      this.listener.onFailed(reason);
+      this.listener.onStatus('Windows Nearby 接收失败：' + reason);
+    }
+  }
+
+  private assertSession(generation: number): void {
+    if (generation !== this.sessionGeneration || this.finished || !this.running) {
+      throw new Error('Windows 接收会话已结束');
     }
   }
 

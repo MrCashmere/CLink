@@ -23,12 +23,20 @@ const MAX_ENTRIES = 200;
 export class QuickShareTransferHistory {
   private static entries: QuickShareTransferHistoryEntry[] = [];
   private static loaded: boolean = false;
+  private static loading?: Promise<void>;
+  private static writes: Promise<void> = Promise.resolve();
 
   static async load(context: common.Context): Promise<void> {
     if (QuickShareTransferHistory.loaded) {
       return;
     }
-    QuickShareTransferHistory.loaded = true;
+    if (QuickShareTransferHistory.loading === undefined) {
+      QuickShareTransferHistory.loading = QuickShareTransferHistory.readStore(context);
+    }
+    await QuickShareTransferHistory.loading;
+  }
+
+  private static async readStore(context: common.Context): Promise<void> {
     try {
       const store = await dataPreferences.getPreferences(context, STORE_NAME);
       const raw = await store.get('entries', '[]');
@@ -52,9 +60,16 @@ export class QuickShareTransferHistory {
       Lg.w('QuickShareTransferHistory load failed: ' + JSON.stringify(error));
       QuickShareTransferHistory.entries = [];
     }
+    QuickShareTransferHistory.loaded = true;
   }
 
   static async add(context: common.Context, entry: QuickShareTransferHistoryEntry): Promise<void> {
+    QuickShareTransferHistory.writes = QuickShareTransferHistory.writes.then((): Promise<void> =>
+      QuickShareTransferHistory.addStored(context, entry));
+    await QuickShareTransferHistory.writes;
+  }
+
+  private static async addStored(context: common.Context, entry: QuickShareTransferHistoryEntry): Promise<void> {
     await QuickShareTransferHistory.load(context);
     QuickShareTransferHistory.entries = [entry].concat(QuickShareTransferHistory.entries).slice(0, MAX_ENTRIES);
     try {
@@ -71,6 +86,13 @@ export class QuickShareTransferHistory {
   }
 
   static async clear(context: common.Context): Promise<void> {
+    QuickShareTransferHistory.writes = QuickShareTransferHistory.writes.then((): Promise<void> =>
+      QuickShareTransferHistory.clearStored(context));
+    await QuickShareTransferHistory.writes;
+  }
+
+  private static async clearStored(context: common.Context): Promise<void> {
+    await QuickShareTransferHistory.load(context);
     QuickShareTransferHistory.entries = [];
     try {
       const store = await dataPreferences.getPreferences(context, STORE_NAME);

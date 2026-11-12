@@ -1,58 +1,46 @@
-# ---- HarmonyOS / DevEco Studio ----
-node_modules/
-oh_modules/
-**/oh_modules/
-build/
-**/build/
-.hvigor/
-.hvigor-home/
-.hvigor-home-fixed/
-.toolhome/
+# IDE, dependencies and build output
 .idea/
-local.properties
-*.har
-*.hap
-*.app
-*.tgz
-oh-package-lock.json5
-.cxx/
-.clangd
-.clang-format
-.eslintrc.js
+.hvigor/
+.hvigor-home*/
+.toolhome/
 .preview/
-**.preview/
+.cxx/
+**/build/
+**/oh_modules/
+**/node_modules/
+**/target/
+entry/libs/
+local.properties
+oh-package-lock.json5
+*.hap
+*.har
+*.hsp
+*.apk
+*.app
 
-# ---- 临时修复脚本/标记（不入库）----
-.fix*.ps1
-.slices-ok
+# Keep signing credentials and local configuration outside the source tree
+.env
+.env.*
+*.key
+*.pem
+*.der
+*.cer
+*.crt
+*.p12
+*.pfx
+*.p7b
+*.jks
+*.keystore
+*.mobileprovision
+signing/
+certs/
 
-# ---- 代理指令文件（不入库，仅供本地 Agent 使用）----
-AGENTS.md
-
-# ---- OS / 编辑器 ----
-Thumbs.db
-Desktop.ini
-.DS_Store
-*.swp
-*~
-.test/
-**/.test/
-
-# ---- 临时脚本 / 调试文件（不入库）----
-tmp_*.py
-tmp_*.js
-tmp_*.ps1
-0
-
-# ---- IDE / 静态分析 / 构建元数据 ----
-.appanalyzer/
-.codegenie/
-.hvigor-local/
-.clang-tidy
-
-# ---- 参考日志（含第三方 NearDrop 克隆，不入库）----
+# Local logs, fixtures and editor files
+*.log
 logcat/
-
-# ---- 本地备份（含签名配置，不入库）----
-backup/
-.backup-*/
+tests/samples/
+**/.test/
+.DS_Store
+Thumbs.db
+*.swp
+__pycache__/

@@ -1,0 +1,20 @@
+HandySend MTA integration
+Upstream: https://gitcode.com/springtwr/HandySend
+License: Apache License 2.0 (licenses/HandySend-Apache-2.0.txt)
+
+The MTA protocol models, cryptography, GATT exchange, P2P orchestration,
+WebSocket/HTTPS protocol, and streaming ZIP implementations retain their upstream
+source. Host integration adapts preferences, directories, logging, history,
+permission checks, native event registration and UI. MtaBleClient and
+MtaBleReceiver adapt system scan and advertising resource ownership to coexist
+with the existing protocols; their original packet builders/parsers are retained.
+
+Brand and phone icons are from EasyShare (https://github.com/HotKids/EasyShare),
+based on CatShare (https://github.com/kmod-midori/CatShare).
+Copyright 2025 Midori Kochiya. MIT license: licenses/EasyShare-MIT.txt.
+
+MTA TLS certificate support uses the unmodified LocalSend v1.18.2 cert.rs:
+https://github.com/localsend/localsend/blob/v1.18.2/packages/core/src/crypto/cert.rs
+LocalSend license: licenses/LocalSend-Apache-2.0.txt.
+Only the certificate support module is linked; this does not replace the
+application's existing LocalSend implementation.

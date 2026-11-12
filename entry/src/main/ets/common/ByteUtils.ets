@@ -1,4 +1,5 @@
 import { util } from '@kit.ArkTS';
+import fs from '@ohos.file.fs';
 
 const textEncoder: util.TextEncoder = new util.TextEncoder();
 const textDecoder: util.TextDecoder = util.TextDecoder.create('utf-8');
@@ -7,6 +8,30 @@ const FRAME_MAX_BYTES = 32 * 1024 * 1024;
 export interface RawFrame {
   readonly type: number;
   readonly payload: Uint8Array;
+}
+
+/** 读取文件 FD 的字节区间；失败返回空数组（不抛异常，便于调用方优雅降级）。 */
+export async function readFileRange(fd: number, offset: number, length: number): Promise<Uint8Array> {
+  if (length <= 0) {
+    return new Uint8Array(0);
+  }
+  try {
+    const buffer = new ArrayBuffer(length);
+    const read = await fs.read(fd, buffer, { offset: offset, length: length });
+    const readLength = typeof read === 'number' ? read : length;
+    if (readLength === length) {
+      return new Uint8Array(buffer);
+    }
+    return new Uint8Array(buffer.slice(0, Math.max(readLength, 0)));
+  } catch (error) {
+    return new Uint8Array(0);
+  }
+}
+
+/** 判断给定的绝对路径是否位于应用沙箱内（photoAccessHelper 的 addResource 只接受沙箱 URI）。 */
+export function isSandboxPath(path: string): boolean {
+  return path.indexOf('/data/storage/') >= 0 || path.indexOf('/storage/Users/') >= 0
+    || path.indexOf('el2/') >= 0 || path.indexOf('/data/app/') >= 0;
 }
 
 export class ByteUtils {

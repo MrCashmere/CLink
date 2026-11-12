@@ -48,6 +48,7 @@ export interface NearbyBleSocketServerConfig {
  */
 class BleSocketStreamConnection implements GsStreamConnection {
   private listener?: (chunk: Uint8Array) => void;
+  private closeListener?: () => void;
   private closed: boolean = false;
 
   private readonly session: BleSocketSession;
@@ -58,6 +59,11 @@ class BleSocketStreamConnection implements GsStreamConnection {
 
   onData(listener: (chunk: Uint8Array) => void): void {
     this.listener = listener;
+  }
+
+  onClose(listener: () => void): void {
+    this.closeListener = listener;
+    if (this.closed) { listener(); }
   }
 
   feed(chunk: Uint8Array): void {
@@ -79,6 +85,8 @@ class BleSocketStreamConnection implements GsStreamConnection {
       return;
     }
     this.closed = true;
+    this.listener = undefined;
+    this.closeListener?.();
     this.session.onStreamClosed();
   }
 
@@ -218,6 +226,10 @@ class BleSocketSession {
   private handleDataPacket(packet: WeaveDataPacket): void {
     if (packet.firstPacket) {
       this.messageBuffer.length = 0;
+    }
+    if (this.messageBuffer.length + packet.data.length > 16 * 1024 * 1024 + 7) {
+      this.close();
+      return;
     }
     for (let i = 0; i < packet.data.length; i++) {
       this.messageBuffer.push(packet.data[i]);

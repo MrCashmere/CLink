@@ -8,10 +8,12 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { OutgoingFile } from '../model/TransferModels';
 import { IconCircleButton } from '../components/IconCircleButton';
 import { AppBackground } from '../components/AppBackground';
-import { HwColor, HwRadius, HwSpace, hwTextPrimary, hwTextSecondary, hwPrimary, hwGlassSurface, hwGlassBorder } from '../utils/DesignTokens';
-import { isApi26OrAbove, immersiveMaterialModifier, legacyMaterialModifier } from '../utils/SystemMaterial';
+import { HwColor, HwRadius, HwSpace, hwTextPrimary, hwTextSecondary, hwPrimary, hwGlassBorder, reloadAppTheme, resolvePageBackground, topBarGlassColor } from '../utils/DesignTokens';
+import { cardGlassEffect, toastSystemMaterial, cardGlassBorderColor, cardGlassShadow } from '../utils/SystemMaterial';
 import { PermissionHelper } from '../common/PermissionHelper';
 import { consumePendingShareUris, nameOfUri } from '../common/ShareHandleUtil';
+import { CardSurface } from '../components/CardSurface';
+import { AccentColorSentinel } from '../components/MaterialCard';
 
 const SHARE_BT_LOCATION_PERMISSIONS: Permissions[] = [
   'ohos.permission.ACCESS_BLUETOOTH',
@@ -29,9 +31,17 @@ const SHARE_BT_LOCATION_PERMISSIONS: Permissions[] = [
 @Entry
 @Component
 struct ShareChoosePage {
+  /** 主题色变化时触发重建，让 HwColor.primary 与选中态取到新色值 */
+  @StorageProp('accentColor') @Watch('onAccentColorChanged') accentColor: string = '';
+  /** 页面底色（由 applyAppTheme 发布）。直接读 HwColor.background 登记不上依赖 */
+  @StorageProp('pageBackground') pageBackground: string = '';
   @StorageProp('statusBarHeight') statusBarHeight: number = 0;
   @StorageProp('isDarkMode') isDarkMode: boolean = false;
   @StorageLink('immersiveLightEnabled') immersiveLightEnabled: boolean = true;
+  @StorageLink('beautifulCards') beautifulCards: boolean = false;
+  @StorageLink('classicCards') classicCards: boolean = false;
+  @StorageLink('cardShadowBorder') cardShadowBorder: boolean = true;
+  @StorageLink('experimentalCards') experimentalCards: boolean = false;
   @StorageLink('fontMode') fontMode: string = 'system';
   @StorageLink('fontFamilyEn') fontFamilyEn: string = 'system';
   @StorageLink('fontFamilyZh') fontFamilyZh: string = 'system';
@@ -97,7 +107,7 @@ struct ShareChoosePage {
 
   private goToChannel(url: string): void {
     if (this.files.length === 0) {
-      promptAction.showToast({ message: '没有可发送的文件' });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '没有可发送的文件' });
       return;
     }
     const paths: string[] = [];
@@ -117,7 +127,7 @@ struct ShareChoosePage {
       }
     }).catch((error: BusinessError): void => {
       Lg.w('ShareChoosePage route ' + url + ' failed: ' + error.message);
-      promptAction.showToast({ message: '无法打开：' + error.message });
+      promptAction.showToast({ systemMaterial: toastSystemMaterial(), message: '无法打开：' + error.message });
     });
   }
 
@@ -142,75 +152,93 @@ struct ShareChoosePage {
 
   @Builder
   channelRow(icon: Resource, title: string, subtitle: string, action: () => void) {
-    Row({ space: 12 }) {
-      IconCircleButton({ symbol: icon, buttonSize: 36, iconSize: 18 })
-      Column({ space: 2 }) {
-        Text(title)
+    CardSurface({ radius: HwRadius.control }) {
+      Row({ space: 12 }) {
+        IconCircleButton({ symbol: icon, buttonSize: 36, iconSize: 18 })
+        Column({ space: 2 }) {
+          Text(title)
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontFamily(this.appFontFamily(title))
+            .fontColor(hwTextPrimary(this.isDarkMode))
+          Text(subtitle)
+            .fontSize(12)
+            .fontColor(hwTextSecondary(this.isDarkMode))
+            .fontFamily(this.appFontFamily(subtitle))
+            .fontWeight(this.appFontWeight())
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+        SymbolGlyph($r('sys.symbol.chevron_right'))
           .fontSize(16)
-          .fontWeight(FontWeight.Medium)
-          .fontFamily(this.appFontFamily(title))
-          .fontColor(hwTextPrimary(this.isDarkMode))
-        Text(subtitle)
-          .fontSize(12)
-          .fontColor(hwTextSecondary(this.isDarkMode))
-          .fontFamily(this.appFontFamily(subtitle))
-          .fontWeight(this.appFontWeight())
+          .fontColor([hwTextSecondary(this.isDarkMode)])
       }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-      SymbolGlyph($r('sys.symbol.chevron_right'))
-        .fontSize(16)
-        .fontColor([hwTextSecondary(this.isDarkMode)])
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.control)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
+      .onClick(() => action())
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.control)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
-    .onClick(() => action())
   }
 
   @Builder
   fileListCard() {
-    Column({ space: 6 }) {
-      Text('已收到 ' + this.files.length + ' 个文件，请选择传输方式')
-        .fontSize(13)
-        .fontWeight(FontWeight.Medium)
-        .fontFamily(this.appFontFamily('已收到 个文件，请选择传输方式'))
-        .fontColor(hwTextPrimary(this.isDarkMode))
-        .width('100%')
-      ForEach(this.files, (file: OutgoingFile) => {
-        Row({ space: 8 }) {
-          Text(file.name)
-            .layoutWeight(1)
-            .fontSize(13)
-            .fontFamily(this.appFontFamily(file.name))
-            .fontWeight(this.appFontWeight())
-            .fontColor(hwTextPrimary(this.isDarkMode))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text(this.fileSizeText(file.size))
-            .fontSize(12)
-            .fontFamily(this.appFontFamily(this.fileSizeText(file.size)))
-            .fontWeight(this.appFontWeight())
-            .fontColor(hwTextSecondary(this.isDarkMode))
-        }
-        .width('100%')
-      }, (file: OutgoingFile): string => file.path)
+    CardSurface({ radius: HwRadius.card }) {
+      Column({ space: 6 }) {
+        Text('已收到 ' + this.files.length + ' 个文件，请选择传输方式')
+          .fontSize(13)
+          .fontWeight(FontWeight.Medium)
+          .fontFamily(this.appFontFamily('已收到 个文件，请选择传输方式'))
+          .fontColor(hwTextPrimary(this.isDarkMode))
+          .width('100%')
+        ForEach(this.files, (file: OutgoingFile) => {
+          Row({ space: 8 }) {
+            Text(file.name)
+              .layoutWeight(1)
+              .fontSize(13)
+              .fontFamily(this.appFontFamily(file.name))
+              .fontWeight(this.appFontWeight())
+              .fontColor(hwTextPrimary(this.isDarkMode))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            Text(this.fileSizeText(file.size))
+              .fontSize(12)
+              .fontFamily(this.appFontFamily(this.fileSizeText(file.size)))
+              .fontWeight(this.appFontWeight())
+              .fontColor(hwTextSecondary(this.isDarkMode))
+          }
+          .width('100%')
+        }, (file: OutgoingFile): string => file.path + ':' + this.accentColor)
+      }
+      .width('100%')
+      .padding(HwSpace.lg)
+      .borderRadius(HwRadius.card)
+      .backgroundColor(Color.Transparent)
+      .backgroundEffect(cardGlassEffect(this.beautifulCards, this.classicCards, this.isDarkMode, this.experimentalCards))
+      .border({ width: 1, color: cardGlassBorderColor(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards) })
+      .clip(true)
+      .shadow(cardGlassShadow(this.beautifulCards, this.cardShadowBorder, this.isDarkMode, this.experimentalCards))
     }
-    .width('100%')
-    .padding(HwSpace.lg)
-    .borderRadius(HwRadius.card)
-    .backgroundColor(hwGlassSurface(this.isDarkMode))
-    .attributeModifier(this.immersiveLightEnabled && isApi26OrAbove() ? immersiveMaterialModifier : legacyMaterialModifier)
-    .border({ width: 1, color: hwGlassBorder(this.isDarkMode) })
-    .clip(true)
+  }
+
+  /** 主题色变了：HwColor 是模块级对象，改属性不会触发刷新，靠这里重建页面 */
+  onAccentColorChanged(): void {
+    reloadAppTheme();
+  }
+
+  /** 当前主题色。读 accentColor 建立依赖；直接写 HwColor.primary 切色后不会重新求值 */
+  private accentOrPrimary(): string {
+    return this.accentColor.length > 0 ? this.accentColor : HwColor.primary;
   }
 
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
+      // 主题色依赖：切色时让整页重新求值（零尺寸，不参与布局）
+      AccentColorSentinel()
       AppBackground()
       Column() {
         Scroll() {
@@ -227,6 +255,7 @@ struct ShareChoosePage {
             this.channelRow($r('sys.symbol.share'), 'Quick Share', '与安卓设备互传文件', () => this.goQuickShare())
             this.channelRow($r('sys.symbol.pc'), 'Windows Nearby', '与电脑附近共享传输文件', () => this.goWindows())
             this.channelRow($r('sys.symbol.share'), 'LocalSend', '局域网协议互传', () => this.goLocalSend())
+            this.channelRow($r('sys.symbol.share'), '互传联盟', 'MTA 附近互传', () => this.goToChannel('pages/Mta'))
           }
           .width('100%')
           .padding({ left: HwSpace.lg, right: HwSpace.lg, top: HwSpace.lg, bottom: 96 })
@@ -242,7 +271,7 @@ struct ShareChoosePage {
       .backgroundColor(Color.Transparent)
 
       Row() {
-        IconCircleButton({ symbol: $r('sys.symbol.chevron_left'), buttonSize: 40, iconSize: 20, onAction: (): void => router.back() })
+        IconCircleButton({ symbol: $r('sys.symbol.chevron_left'), glass: true, buttonSize: 40, iconSize: 20, onAction: (): void => router.back() })
         Text('系统分享')
           .fontSize(20)
           .fontWeight(FontWeight.Bold)
@@ -254,11 +283,11 @@ struct ShareChoosePage {
       .width('100%')
       .height(56 + this.statusBarHeight)
       .padding({ left: 16, right: 16, top: this.statusBarHeight })
-      .backgroundEffect({ radius: 12, color: '#66FFFFFF' })
+      .backgroundEffect({ radius: 12, color: topBarGlassColor(this.isDarkMode) })
     }
     .width('100%')
     .height('100%')
-    .backgroundColor(this.isDarkMode ? HwColor.backgroundDark : HwColor.background)
+    .backgroundColor(resolvePageBackground(this.isDarkMode, this.pageBackground))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 }

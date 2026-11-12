@@ -53,6 +53,14 @@ const APP_HANDSHAKE_ID = '0d472c30-80b5-4722-a279-0f3b97f0dcf2';
 const APP_PLATFORM_NAME = 'NearSharePlatform';
 const CONNECT_TIMEOUT_MS = 8000;
 const HANDSHAKE_TIMEOUT_MS = 15000;
+const MAX_FETCH_BYTES = 16 * 1024 * 1024;
+const MAX_INPUT_QUEUE_BYTES = 32 * 1024 * 1024;
+const MAX_FETCH_RANGES = 8192;
+
+interface SentRange {
+  start: number;
+  end: number;
+}
 const SESSION_ID_HOST_FLAG = 0x80000000;
 
 export interface WindowsNearbyOutgoingFile {
@@ -104,13 +112,24 @@ export class WindowsNearbySender {
   private transferStarted = false;
   private operationId: string = '';
   private files: WindowsNearbyOutgoingFile[] = [];
-  private fileContents: Map<number, Uint8Array> = new Map<number, Uint8Array>();
+  private sourcePaths: string[] = [];
+  private spoolDir: string = '';
+  private sentRanges: Map<number, SentRange[]> = new Map();
+  private readQueue: Promise<void> = Promise.resolve();
+  private queuedReadBytes: number = 0;
   private bytesToSend: number = 0;
   private bytesSent: number = 0;
   private completionResolve?: () => void;
+  private completionReject?: (error: Error) => void;
+  private completionError?: Error;
+  private completed: boolean = false;
+  private completionTimer: number = -1;
+  private sending: boolean = false;
   private writeQueue: Promise<void> = Promise.resolve();
 
   private waiterKind?: 'connect' | 'control' | 'session';
+  private waiterReject?: (error: Error) => void;
+  private pendingMessages: CdpClientMsg[] = [];
   private waiterChannel?: number;
   private waiterResolve?: (msg: CdpClientMsg) => void;
 
@@ -126,43 +145,75 @@ export class WindowsNearbySender {
   }
 
   async send(host: string, port: number, files: WindowsNearbyOutgoingFile[]): Promise<void> {
+    if (this.sending) {
+      throw new Error('另一个 Windows 发送任务正在进行');
+    }
+    this.sending = true;
+    this.completed = false;
+    this.completionError = undefined;
+    this.pendingMessages = [];
+    this.readQueue = Promise.resolve();
+    this.queuedReadBytes = 0;
+    try {
+      await this.runSend(host, port, files);
+    } finally {
+      this.cleanupSources();
+      this.sentRanges.clear();
+      this.sending = false;
+      this.pendingMessages = [];
+      if (this.completionTimer !== -1) {
+        clearTimeout(this.completionTimer);
+        this.completionTimer = -1;
+      }
+    }
+  }
+
+  private async runSend(host: string, port: number, files: WindowsNearbyOutgoingFile[]): Promise<void> {
     if (host.length === 0) {
       throw new Error('缺少 Windows 主机 IP');
     }
     this.files = files;
     Lg.i(LOG_TAG + ': sending to ' + host + ':' + port + ' files=' + files.length);
     this.bytesToSend = 0;
-    for (const file of files) {
-      this.bytesToSend += file.size;
-    }
     this.bytesSent = 0;
     this.transferStarted = false;
     this.cryptor = undefined;
-    // Read each selected file fully into memory up-front. The DocumentViewPicker
-    // returns a content URI on which lseek is unreliable; serving chunks from a
-    // cached buffer avoids reading from the wrong offset and corrupting the file.
-    this.fileContents.clear();
+    this.buffer = new Uint8Array(0);
+    for (const file of files) {
+      if (!Number.isSafeInteger(file.size) || file.size < 0) {
+        throw new Error('发送源文件大小无效');
+      }
+      this.bytesToSend += file.size;
+    }
+    if (files.length === 0 || !Number.isSafeInteger(this.bytesToSend)) { throw new Error('发送文件列表无效'); }
+    // A picker URI need not support seeking. Copy it once into a seekable file
+    // using a fixed-size buffer; ordinary sandbox paths can be read in place.
     for (let i = 0; i < files.length; i++) {
-      this.fileContents.set(i, await this.readWholeFile(files[i].path));
+      this.sourcePaths.push(await this.prepareSource(files[i], i));
+      this.assertPreparing();
     }
 
     const tcp = socket.constructTCPSocketInstance();
-    await tcp.bind({ address: '0.0.0.0', family: 1, port: 0 });
-    tcp.on('message', (info: socket.SocketMessageInfo): void => {
-      this.onData(new Uint8Array(info.message));
-    });
-    tcp.on('error', (error: BusinessError): void => {
-      this.listener.onStatus('发送 socket 错误：' + JSON.stringify(error));
-    });
-    tcp.on('close', (): void => {
-      this.listener.onStatus('发送 socket 已关闭');
-    });
     this.tcp = tcp;
-
     try {
+      await tcp.bind({ address: '0.0.0.0', family: 1, port: 0 });
+      this.assertSocket(tcp);
+      tcp.on('message', (info: socket.SocketMessageInfo): void => {
+        if (this.tcp !== tcp) { return; }
+        this.onData(new Uint8Array(info.message));
+      });
+      tcp.on('error', (error: BusinessError): void => {
+        if (this.tcp !== tcp) { return; }
+        this.listener.onStatus('发送 socket 错误：' + JSON.stringify(error));
+        this.failCompletion(new Error('发送连接错误：' + error.message));
+      });
+      tcp.on('close', (): void => {
+        if (this.tcp !== tcp) { return; }
+        this.listener.onStatus('发送 socket 已关闭');
+        this.failCompletion(new Error('对端连接已断开，发送未完成'));
+      });
       await this.connectTcp(tcp, host, port);
       Lg.i(LOG_TAG + ': TCP connected to ' + host + ':' + port);
-      this.buffer = new Uint8Array(0);
       // The CDP handshake has no per-step acknowledgement timeout on its own; a peer
       // that accepts TCP but never answers ConnectResponse/DeviceAuth would otherwise
       // hang send() forever with no toast/progress ("完全没反应"). Bound it so a
@@ -178,11 +229,16 @@ export class WindowsNearbySender {
   }
 
   async close(): Promise<void> {
+    if (this.sending && !this.completed) {
+      this.failCompletion(new Error('发送已停止'));
+    }
     const tcp = this.tcp;
     this.tcp = undefined;
     if (tcp !== undefined) {
       try {
         tcp.off('message');
+        tcp.off('close');
+        tcp.off('error');
       } catch (error) {
         Lg.w(LOG_TAG + ': tcp off failed: ' + JSON.stringify(error));
       }
@@ -200,36 +256,58 @@ export class WindowsNearbySender {
   }
 
   private onData(chunk: Uint8Array): void {
+    const ownedSocket = this.tcp;
+    if (ownedSocket === undefined || this.completionError !== undefined) { return; }
+    if (this.buffer.length + chunk.length + this.queuedReadBytes > MAX_INPUT_QUEUE_BYTES) {
+      this.failCompletion(new Error('Windows CDP 接收队列超限'));
+      return;
+    }
     this.buffer = ByteUtils.concat([this.buffer, chunk]);
     while (this.buffer.length >= 4) {
       const messageLength = CdpCommonHeader.readRawMessageLength(this.buffer);
-      if (messageLength < 42 || messageLength > 32 * 1024 * 1024) {
-        this.buffer = new Uint8Array(0);
+      if (messageLength < 42 || messageLength > MAX_INPUT_QUEUE_BYTES) {
+        this.failCompletion(new Error('Windows CDP 帧长度无效'));
         return;
       }
-      if (this.buffer.length < messageLength) {
-        return;
-      }
+      if (this.buffer.length < messageLength) { return; }
       const frame = this.buffer.slice(0, messageLength);
       this.buffer = this.buffer.slice(messageLength);
-      this.processFrame(frame).catch((error: Error): void => {
-        Lg.w(LOG_TAG + ': CDP process error: ' + error.message);
-        this.listener.onStatus('发送 CDP 处理失败：' + error.message);
+      this.queuedReadBytes += frame.length;
+      this.readQueue = this.readQueue.then(async (): Promise<void> => {
+        if (this.tcp !== ownedSocket || this.completionError !== undefined) { return; }
+        await this.processFrame(frame);
+      }).catch((error: Error): void => {
+        if (this.tcp === ownedSocket) {
+          Lg.w(LOG_TAG + ': CDP process error: ' + error.message);
+          this.failCompletion(error);
+        }
+      }).finally((): void => {
+        if (this.tcp === ownedSocket) { this.queuedReadBytes -= frame.length; }
       });
     }
   }
 
   private async processFrame(frame: Uint8Array): Promise<void> {
+    const ownedSocket = this.tcp;
     const reader = new CdpReader(frame);
     const header = reader.readHeader();
     Lg.i(LOG_TAG + ': recv frame type=' + header.type + ' seq=' + header.sequenceNumber +
       ' enc=' + header.hasFlag(CdpMessageFlags.SessionEncrypted) + ' len=' + frame.length);
     let payload: Uint8Array;
-    if (header.hasFlag(CdpMessageFlags.SessionEncrypted) && this.cryptor !== undefined) {
-      payload = await this.cryptor.decryptFrame(frame, header);
+    const encrypted = header.hasFlag(CdpMessageFlags.SessionEncrypted);
+    if (encrypted) {
+      const cryptor = this.cryptor;
+      if (cryptor === undefined || !header.hasFlag(CdpMessageFlags.HasHMAC)) {
+        throw new Error('Windows CDP 帧缺少会话认证');
+      }
+      payload = await cryptor.decryptFrame(frame, header);
     } else {
+      if (this.cryptor !== undefined || header.type !== CdpMessageType.Connect) {
+        throw new Error('Windows CDP 收到未认证的明文帧');
+      }
       payload = frame.slice(header.calcSize());
     }
+    if (ownedSocket === undefined || ownedSocket !== this.tcp) { return; }
 
     if (header.type === CdpMessageType.Connect) {
       const payloadReader = new CdpReader(payload);
@@ -287,8 +365,10 @@ export class WindowsNearbySender {
   }
 
   private async runHandshake(): Promise<void> {
+    const ownedSocket = this.tcp;
     // 1. ConnectRequest.
     this.localNonce = await randomBytes(8);
+    this.assertSocket(ownedSocket);
     this.localSessionHi = this.nextLocalSessionId++;
     this.remoteSessionHi = 0;
     const point = this.security.publicPoint;
@@ -310,12 +390,14 @@ export class WindowsNearbySender {
     this.remoteNonce = connResponse.nonceBytes;
     this.remoteSessionHi = readU32BE(connectResp.header.sessionId, 0) & ~SESSION_ID_HOST_FLAG;
     const secret = await this.security.deriveSharedSecret(connResponse.publicKeyX, connResponse.publicKeyY);
+    this.assertSocket(ownedSocket);
     this.cryptor = CdpSecurity.createCryptor(secret);
     Lg.i(LOG_TAG + ': session cryptor established');
     this.listener.onStatus('CDP 握手：会话加密已建立');
 
     // 3. DeviceAuthRequest.
     const deviceSigned = await this.security.signThumbprint(this.remoteNonce, this.localNonce);
+    this.assertSocket(ownedSocket);
     const deviceAuthPayload = new CdpAuthenticationPayload();
     deviceAuthPayload.certificate = this.security.certificateDer;
     deviceAuthPayload.signedThumbprint = deviceSigned;
@@ -325,8 +407,10 @@ export class WindowsNearbySender {
     // 4. DeviceAuthResponse -> verify -> UserDeviceAuthRequest.
     const deviceAuthResp = await this.awaitMessage('connect', CdpConnectionType.DeviceAuthResponse);
     await this.verifyAuthPayload(deviceAuthResp.reader);
+    this.assertSocket(ownedSocket);
     Lg.i(LOG_TAG + ': verified DeviceAuthResponse');
     const userSigned = await this.security.signThumbprint(this.remoteNonce, this.localNonce);
+    this.assertSocket(ownedSocket);
     const userDeviceAuth = new CdpAuthenticationPayload();
     userDeviceAuth.certificate = this.security.certificateDer;
     userDeviceAuth.signedThumbprint = userSigned;
@@ -336,6 +420,7 @@ export class WindowsNearbySender {
     // 5. UserDeviceAuthResponse -> verify -> AuthDoneRequest.
     const userAuth = await this.awaitMessage('connect', CdpConnectionType.UserDeviceAuthResponse);
     await this.verifyAuthPayload(userAuth.reader);
+    this.assertSocket(ownedSocket);
     Lg.i(LOG_TAG + ': verified UserDeviceAuthResponse');
     await this.sendConnected(CdpConnectionType.AuthDoneRequest, () => new CdpResultPayload(CdpResult.Success));
     Lg.i(LOG_TAG + ': sent AuthDoneRequest');
@@ -351,6 +436,7 @@ export class WindowsNearbySender {
 
     // 7. DeviceInfoMessage.
     const deviceInfoJson = await buildSenderDeviceInfoJson(SettingsAliasProvider.instance.alias());
+    this.assertSocket(ownedSocket);
     await this.sendConnected(CdpConnectionType.DeviceInfoMessage, () => {
       const info = new CdpDeviceInfoMessage();
       info.deviceInfoJson = deviceInfoJson;
@@ -394,8 +480,11 @@ export class WindowsNearbySender {
   }
 
   private async handleFetchRequest(binaryHeader: CdpBinaryMsgHeader, valueSet: CdpValueSet): Promise<void> {
+    const ownedSocket = this.tcp;
     const control = valueSet.getUInt32('ControlMessage');
+    if (control === 5) { throw new Error('Windows 对端取消传输'); }
     if (control === 2) { // CompleteTransfer
+      if (this.bytesSent !== this.bytesToSend) { throw new Error('Windows 在文件传完前确认了完成'); }
       this.listener.onStatus('Windows 已确认接收完成');
       this.resolveCompletion();
       this.listener.onCompleted();
@@ -405,6 +494,7 @@ export class WindowsNearbySender {
     if (control !== 3) { // FetchDataRequest
       return;
     }
+    this.armCompletionTimeout();
     const contentId = valueSet.getUInt32('ContentId');
     const start = valueSet.getUInt64('BlobPosition');
     const length = valueSet.getUInt32('BlobSize');
@@ -413,23 +503,72 @@ export class WindowsNearbySender {
       throw new Error('CDP 未知 ContentId ' + contentId);
     }
     const blob = await this.readBlob(start, length, contentId);
+    this.assertSocket(ownedSocket);
     const response = new CdpValueSet();
     response.addUInt32('ControlMessage', 4); // FetchDataResponse
     response.addUInt32('ContentId', contentId);
     response.addUInt64('BlobPosition', start);
     response.addUInt8Array('DataBlob', blob);
     await this.sendValueSetOnChannel(this.platformChannelId, response, binaryHeader.messageId);
-    this.bytesSent += blob.length;
+    this.assertSocket(ownedSocket);
+    if (blob.length > 0) {
+      this.bytesSent += this.recordSentRange(contentId, start, start + blob.length);
+    }
     this.listener.onProgress(this.bytesToSend === 0 ? 100 : Math.floor(this.bytesSent * 100 / this.bytesToSend));
   }
 
   private awaitCompletion(): Promise<void> {
-    return new Promise<void>((resolve: () => void): void => {
+    if (this.completionError !== undefined) {
+      return Promise.reject(this.completionError);
+    }
+    if (this.completed) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve: () => void, reject: (error: Error) => void): void => {
       this.completionResolve = resolve;
+      this.completionReject = reject;
+      this.armCompletionTimeout();
     });
   }
 
+  private armCompletionTimeout(): void {
+    if (this.completionTimer !== -1) {
+      clearTimeout(this.completionTimer);
+    }
+    this.completionTimer = setTimeout((): void => {
+      this.completionTimer = -1;
+      this.failCompletion(new Error('Windows 对端长时间未响应，发送已超时'));
+    }, 120000);
+  }
+
+  private failCompletion(error: Error): void {
+    if (this.completed) {
+      return;
+    }
+    this.completionError = error;
+    if (this.completionTimer !== -1) {
+      clearTimeout(this.completionTimer);
+      this.completionTimer = -1;
+    }
+    const reject: ((error: Error) => void) | undefined = this.completionReject;
+    this.completionReject = undefined;
+    this.completionResolve = undefined;
+    const rejectWaiter = this.waiterReject;
+    this.waiterReject = undefined;
+    this.waiterResolve = undefined;
+    this.waiterKind = undefined;
+    this.waiterChannel = undefined;
+    rejectWaiter?.(error);
+    reject?.(error);
+  }
+
   private resolveCompletion(): void {
+    this.completed = true;
+    this.completionReject = undefined;
+    if (this.completionTimer !== -1) {
+      clearTimeout(this.completionTimer);
+      this.completionTimer = -1;
+    }
     if (this.completionResolve !== undefined) {
       const resolve = this.completionResolve;
       this.completionResolve = undefined;
@@ -437,28 +576,98 @@ export class WindowsNearbySender {
     }
   }
 
-  private async readBlob(start: number, length: number, contentId: number): Promise<Uint8Array> {
-    const content = this.fileContents.get(contentId);
-    if (content === undefined) {
-      throw new Error('CDP 文件未缓存 contentId=' + contentId);
+  private recordSentRange(contentId: number, start: number, end: number): number {
+    const ranges = this.sentRanges.get(contentId) ?? [];
+    let index = 0;
+    while (index < ranges.length && ranges[index].end < start) { index += 1; }
+    let fresh = end - start;
+    let from = start;
+    let to = end;
+    let next = index;
+    while (next < ranges.length && ranges[next].start <= to) {
+      const range = ranges[next];
+      fresh -= Math.max(0, Math.min(end, range.end) - Math.max(start, range.start));
+      from = Math.min(from, range.start);
+      to = Math.max(to, range.end);
+      next += 1;
     }
-    if (start + length > content.length) {
-      throw new Error('CDP 请求越界：pos=' + start + ' len=' + length + ' size=' + content.length);
-    }
-    return content.slice(start, start + length);
+    if (next === index && ranges.length >= MAX_FETCH_RANGES) { throw new Error('Windows CDP 请求过于零散'); }
+    ranges.splice(index, next - index, { start: from, end: to });
+    this.sentRanges.set(contentId, ranges);
+    return fresh;
   }
 
-  private async readWholeFile(path: string): Promise<Uint8Array> {
+  private async readBlob(start: number, length: number, contentId: number): Promise<Uint8Array> {
+    const path = this.sourcePaths[contentId];
+    const size = this.files[contentId]?.size ?? -1;
+    if (path === undefined || !Number.isSafeInteger(start) || start < 0 ||
+      !Number.isSafeInteger(length) || length < 0 || length > MAX_FETCH_BYTES || length > size - start) {
+      throw new Error('Windows CDP 文件读取范围无效');
+    }
+    const result = new Uint8Array(length);
     const handle = fs.openSync(path, fs.OpenMode.READ_ONLY);
     try {
-      const stat = fs.statSync(path);
-      const buffer = new ArrayBuffer(stat.size);
-      const count = await fs.read(handle.fd, buffer, { offset: 0, length: stat.size });
-      Lg.i(LOG_TAG + ': loaded file stat=' + stat.size + ' read=' + count);
-      return count >= 0 ? new Uint8Array(buffer.slice(0, count)) : new Uint8Array(0);
+      let read = 0;
+      while (read < length) {
+        const buffer = new ArrayBuffer(Math.min(1024 * 1024, length - read));
+        const count = await fs.read(handle.fd, buffer, { offset: start + read, length: buffer.byteLength });
+        if (count <= 0 || count > buffer.byteLength) { throw new Error('发送源文件未完整读入'); }
+        result.set(new Uint8Array(buffer, 0, count), read);
+        read += count;
+      }
     } finally {
       fs.closeSync(handle);
     }
+    return result;
+  }
+
+  private assertPreparing(): void {
+    if (this.completionError !== undefined) { throw this.completionError; }
+  }
+
+  private async prepareSource(file: WindowsNearbyOutgoingFile, index: number): Promise<string> {
+    const source = fs.openSync(file.path, fs.OpenMode.READ_ONLY);
+    try {
+      if (fs.statSync(source.fd).size !== file.size) { throw new Error('发送源文件大小已变化，请重新选择文件'); }
+      if (file.path.startsWith('/')) { return file.path; }
+      if (this.spoolDir.length === 0) {
+        this.spoolDir = fs.mkdtempSync(this.context.cacheDir + '/windows-send-XXXXXX');
+      }
+      const path = this.spoolDir + '/' + index;
+      const target = fs.openSync(path, fs.OpenMode.WRITE_ONLY | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        let copied = 0;
+        while (copied < file.size) {
+          this.assertPreparing();
+          const buffer = new ArrayBuffer(Math.min(1024 * 1024, file.size - copied));
+          const read = await fs.read(source.fd, buffer);
+          if (read <= 0 || read > buffer.byteLength) { throw new Error('发送源文件未完整读入'); }
+          let wrote = 0;
+          while (wrote < read) {
+            const count = await fs.write(target.fd, buffer.slice(wrote, read));
+            if (count <= 0 || count > read - wrote) { throw new Error('无法写入发送缓存'); }
+            wrote += count;
+          }
+          copied += wrote;
+        }
+        return path;
+      } catch (error) {
+        try { fs.unlinkSync(path); } catch (_error) {}
+        throw (error instanceof Error ? error : new Error(String(error)));
+      } finally {
+        fs.closeSync(target);
+      }
+    } finally {
+      fs.closeSync(source);
+    }
+  }
+
+  private cleanupSources(): void {
+    if (this.spoolDir.length > 0) {
+      try { fs.rmdirSync(this.spoolDir); } catch (_error) {}
+      this.spoolDir = '';
+    }
+    this.sourcePaths = [];
   }
 
   private async sendConnect(connectionType: number, build: () => CdpConnectionBody): Promise<void> {
@@ -539,8 +748,10 @@ export class WindowsNearbySender {
   }
 
   private async sendRaw(header: CdpCommonHeader, payload: Uint8Array): Promise<void> {
+    const ownedSocket = this.tcp;
     if (this.cryptor !== undefined) {
       const frame = await this.cryptor.encryptMessage(header, payload);
+      this.assertSocket(ownedSocket);
       await this.writeFrame(frame);
     } else {
       const writer = new CdpWriter();
@@ -559,6 +770,7 @@ export class WindowsNearbySender {
     // Serialise all writes so a burst of FetchDataResponse chunks never issues
     // overlapping socket.send calls (the CDP reference locks the output stream).
     const run = this.writeQueue.then(async (): Promise<void> => {
+      this.assertSocket(tcp);
       await tcp.send({ data: ByteUtils.toArrayBuffer(frame) });
     });
     this.writeQueue = run.catch((error: Error): void => {
@@ -608,6 +820,7 @@ export class WindowsNearbySender {
 
   private deliver(msg: CdpClientMsg): void {
     if (this.waiterResolve === undefined) {
+      this.queueMessage(msg);
       return;
     }
     if (this.waiterKind === 'connect' && msg.kind === 'connect' && msg.connType === this.waiterChannel) {
@@ -622,11 +835,24 @@ export class WindowsNearbySender {
       this.resolveWaiter(msg);
       return;
     }
+    this.queueMessage(msg);
+  }
+
+  private queueMessage(msg: CdpClientMsg): void {
+    if (this.pendingMessages.length >= 64) { this.failCompletion(new Error('Windows 握手响应队列已满')); return; }
+    this.pendingMessages.push(msg);
+  }
+
+  private assertSocket(tcp: socket.TCPSocket | undefined): void {
+    if (tcp === undefined || this.tcp !== tcp || this.completionError !== undefined) {
+      throw new Error('Windows 发送会话已结束');
+    }
   }
 
   private resolveWaiter(msg: CdpClientMsg): void {
     const resolve = this.waiterResolve;
     this.waiterResolve = undefined;
+    this.waiterReject = undefined;
     this.waiterKind = undefined;
     this.waiterChannel = undefined;
     if (resolve !== undefined) {
@@ -635,10 +861,15 @@ export class WindowsNearbySender {
   }
 
   private awaitMessage(kind: 'connect' | 'control' | 'session', key: number): Promise<CdpClientMsg> {
-    return new Promise<CdpClientMsg>((resolve: (msg: CdpClientMsg) => void): void => {
+    if (this.completionError !== undefined) { return Promise.reject(this.completionError); }
+    const index = this.pendingMessages.findIndex((msg: CdpClientMsg): boolean => msg.kind === kind &&
+      (kind === 'connect' ? msg.connType === key : kind === 'control' ? msg.controlType === key : msg.channelId === key));
+    if (index >= 0) { return Promise.resolve(this.pendingMessages.splice(index, 1)[0]); }
+    return new Promise<CdpClientMsg>((resolve: (msg: CdpClientMsg) => void, reject: (error: Error) => void): void => {
       this.waiterKind = kind;
       this.waiterChannel = key;
       this.waiterResolve = resolve;
+      this.waiterReject = reject;
     });
   }
 }

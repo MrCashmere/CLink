@@ -7,10 +7,15 @@ import { picker, fileUri } from '@kit.CoreFileKit';
 import { ByteUtils } from '../../common/ByteUtils';
 import { SecurityUtils } from '../../common/SecurityUtils';
 import { SettingsStore } from '../../common/SettingsStore';
-import { DeviceIdentity } from '../../common/DeviceIdentity';
 import { CertificateStore } from '../../common/CertificateStore';
-import { IncomingFile, SessionFileMeta, WebShareInfo } from '../../model/TransferModels';
+import { IncomingFile, OutgoingFile, SessionFileMeta, WebShareInfo } from '../../model/TransferModels';
+import { DynamicPhotoService } from '../../common/DynamicPhotoService';
+import { DynamicPhotoBridge } from '../../common/DynamicPhotoBridge';
+import { PeerDecision, PeerLivePhotoFormat } from '../../common/PeerLivePhotoFormat';
+import { GalleryAutoSaveService } from '../../quickshare/service/GalleryAutoSaveService';
+import { GalleryMediaClassifier } from '../../quickshare/storage/GalleryMediaClassifier';
 import tlsNative from 'libtls_transport.so';
+import { sendNativeTls } from '../../common/TlsTransport';
 
 export interface IncomingSessionRequest {
   readonly sessionId: string;
@@ -24,6 +29,14 @@ export interface LocalSendIncomingHandler {
   onSessionResolved(sessionId: string, accepted: boolean): void;
   onFileReceived(sessionId: string, file: IncomingFile): void;
   onProgress(sessionId: string, progress: number): void;
+  onSessionFailed?(sessionId: string, error: string): void;
+  /**
+   * 文件已完整落盘到应用沙箱、**尚未**被搬到下载目录时调用（await 期间会推迟搬运）。
+   *
+   * 存在的理由：搬运会把沙箱副本复制到下载目录后删掉源文件，而下载目录路径应用没有读
+   * 权限 —— 动态图片需要在沙箱副本还在时读完并解析（见 DynamicPhotoService）。
+   */
+  onFileStaged(sessionId: string, file: IncomingFile): Promise<void>;
 }
 
 interface OpenStreamResult {
@@ -35,15 +48,16 @@ interface StreamState {
   file: fs.File;
   path: string;
   sessionId: string;
+  fileId: string;
   name: string;
+  mime?: string;
   lastPct: number;
   pos: number;
   total: number;
   received: number;
   chunkSize: number;
-  waitingLine: boolean;
+  chunkPhase: number;
   mpDelim?: Uint8Array;
-  mpPhase: number;
 }
 
 interface SessionState {
@@ -51,10 +65,12 @@ interface SessionState {
   readonly pin: string;
   readonly files: Map<string, SessionFileMeta>;
   receivedBytes: number;
-  completed: number;
+  readonly activeFiles: Set<string>;
+  readonly receivedFiles: Set<string>;
+  readonly savedFiles: Set<string>;
   totalBytes: number;
-  activeStreams: number;
   expiresAt: number;
+  failed?: boolean;
 }
 
 /** 本机向网页端（局域网网页传输）共享的文件元信息与有效期。 */
@@ -65,6 +81,15 @@ interface ShareState {
   readonly size: number;
   readonly addedAt: number;
   expiresAt: number;
+}
+
+/** 按浏览器设备改写后的下载产物（缓存在 `webConverted` 里）。 */
+interface WebConvertedShare {
+  readonly path: string;
+  readonly name: string;
+  readonly size: number;
+  /** 需要第二个文件的形态（Apple 实况照片：JPEG + MOV）时，伴侣文件的共享 id。 */
+  readonly companionId: string;
 }
 
 interface ServerConnection {
@@ -171,18 +196,7 @@ class TlsServerConnection implements ServerConnection {
   }
 
   sendBytes(data: Uint8Array): Promise<void> {
-    // Allow writing even when this.closed is set: the server sends the final `200 OK`
-    // response and then closes; if a prior "closed" flag was set (e.g. we raced a close),
-    // refusing here would drop the success response and make the sender retry. Only a
-    // torn-down handle (==0) is a hard failure.
-    if (this.handle <= 0) {
-      return Promise.reject(new Error('TLS connection closed'));
-    }
-    const written = tlsNative.send(this.handle, ByteUtils.toArrayBuffer(data)) as number;
-    if (written < 0) {
-      return Promise.reject(new Error('TLS send failed'));
-    }
-    return Promise.resolve();
+    return sendNativeTls(this.handle, data, (): boolean => !this.closed);
   }
 
   onData(listener: (chunk: Uint8Array) => void): void {
@@ -263,15 +277,31 @@ interface MpPartResult {
 
 
 const PORT = 53317;
-/** 网页端「局域网网页传输」专用端口：始终用明文 HTTP，避免 HTTPS 自签证书在浏览器上的拦截。 */
-const WEB_PORT = 53318;
+/**
+ * 网页端「局域网网页传输」专用端口：始终用明文 HTTP，避免 HTTPS 自签证书在浏览器上的拦截。
+ *
+ * ⚠️ 不要改成 53317/53318/53319，也不要改回 53318：
+ * - 53317 = LocalSend 主端口（含 UDP 组播 / 子网扫描 / mDNS 通告）；
+ * - 53318 = Quick Share 标准接收端口（`gs/src/main/ets/model/GsConstants.ets` 的
+ *   `GS_QUICKSHARE_PORT`，`quickshare/controller/QuickShareBrowser.ets` 另有一份副本）。
+ *   历史上本常量曾等于 53318：`AppServices.doStartReceive()` 先起 LocalSendServer（网页
+ *   监听先占住 53318），再起 Quick Share 接收端 → Quick Share bind 失败，而 mDNS 仍按
+ *   53318 对外通告，对端入站连接被网页 HTTP 解析器接管（收不到文件）；
+ * - 53319 = Quick Share 环回自检端口（`QuickShareChannel.selfTest`）。
+ *
+ * 选 23333 的理由：低于 Linux/Android 的临时端口区间（典型 32768–60999，53317/53318/53319
+ * 都在区间内，监听端口可能被出站连接的随机源端口偶发占用）；不在浏览器禁用端口表内；
+ * IANA 未分配；与上述端口全不冲突。
+ */
+const WEB_PORT = 23333;
+/** 网页监听的回退候选端口：首选被别的进程占用时依次尝试，全部失败则置 0 并明确报错。 */
+const WEB_PORT_CANDIDATES: number[] = [23333, 23334, 23335];
 const CRLF_CRLF = new Uint8Array([13, 10, 13, 10]);
 const CRLF = new Uint8Array([13, 10]);
 const MAX_HEAD_BYTES = 64 * 1024;
 const MAX_BODY_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_CONTROL_BODY_BYTES = 16 * 1024 * 1024;
 const MAX_SNIFF_WAIT_BYTES = 1024 * 1024;
-const MAX_OVERREAD_BYTES = 16 * 1024 * 1024;
 const MAX_MP_SCAN_BYTES = 1024 * 1024;
 const MAX_MP_HEADER_BYTES = 64 * 1024;
 const IDLE_SETTLE_MS = 60000;
@@ -281,11 +311,36 @@ const SESSION_SWEEP_MS = 60 * 1000;
 const MAX_SESSIONS = 16;
 const SHARE_TTL_MS = 30 * 60 * 1000;
 
+/** HTTP 层拿到的对端身份信号（register / send-request 请求自带对端的设备信息）。 */
+export interface LocalSendPeerSignal {
+  readonly address: string;
+  readonly alias: string;
+  readonly deviceModel: string;
+  readonly fingerprint: string;
+  readonly port: number;
+  readonly protocol: string;
+}
+
+/** register / send-request 请求体里可能出现的对端字段（宽容解析，缺啥留空）。 */
+interface PeerInfoJson {
+  alias?: string;
+  deviceModel?: string;
+  fingerprint?: string;
+  port?: number;
+  protocol?: string;
+}
+
 export class LocalSendServer {
+  /**
+   * 对端身份信号回调：对端收到本机 announce 后会 POST /register 自报家门（LocalSend v2 协议），
+   * 发送请求 /send-request 里也带对端 info。热点模式下组播收包不可靠，这条 TCP 单播通道是
+   * 「对端主动告诉本机我在这里」的最稳信号，由 AppServices 接到发现链路上屏。
+   */
+  static onPeerSignal?: (signal: LocalSendPeerSignal) => void;
   private static downloadDirUri: string = '';
   static lastHttpsActive: boolean = false;
-  static actualPort: number = PORT;
-  static actualWebPort: number = WEB_PORT;
+  static actualPort: number = 0;
+  static actualWebPort: number = 0;
   private tcpServer?: socket.TCPSocketServer;
   private webTcpServer?: socket.TCPSocketServer;
   private listenHandle: number = 0;
@@ -294,10 +349,20 @@ export class LocalSendServer {
   private readonly shares: Map<string, ShareState> = new Map();
   private handler?: LocalSendIncomingHandler;
   private started = false;
+  private generation: number = 0;
+  private startOperation?: Promise<void>;
+  private closeOperation: Promise<void> = Promise.resolve();
   private httpsActiveValue = false;
   private sweepTimer: number = -1;
   /** 缓存浏览器「局域网网页传输」HTML 页面，避免每次请求都读一次 rawfile。 */
   private webHtmlCache: string = '';
+  /**
+   * 网页端下载时的「按浏览器设备改写后」的产物缓存（键 = 共享 id + 目标格式 + 方言）。
+   *
+   * 为什么必须缓存：一次转换要整份读入、重建 XMP/MPF、再写一份（真机样本 9.5 MB），
+   * 浏览器还可能重复请求（用户点两次、断线重试）。同一个共享 + 同一类设备只转一次。
+   */
+  private readonly webConverted: Map<string, WebConvertedShare> = new Map();
 
   private readonly certs: CertificateStore;
   private readonly context: common.Context;
@@ -334,6 +399,7 @@ export class LocalSendServer {
   removeShare(id: string): boolean {
     const removed = this.shares.delete(id);
     if (removed) {
+      this.releaseWebConverted(id);
       Lg.i('羊绒互传 web share removed: ' + id);
     }
     return removed;
@@ -351,47 +417,122 @@ export class LocalSendServer {
 
   private pruneExpiredShares(): void {
     const now = Date.now();
+    const expired: string[] = [];
     this.shares.forEach((s: ShareState, id: string): void => {
       if (s.expiresAt <= now) {
-        this.shares.delete(id);
+        expired.push(id);
       }
     });
+    for (const id of expired) {
+      this.shares.delete(id);
+      this.releaseWebConverted(id);
+    }
+  }
+
+  /**
+   * 释放某个共享对应的「按浏览器改写」产物：丢掉缓存条目，并删掉改写产生的临时文件。
+   *
+   * 只删动态图片工作目录里的文件：改写产物都写在那里（`DynamicPhotoBridge.workDir`）；
+   * 用户原始文件绝不在删除范围内，`path === share.path` 的条目直接跳过。
+   */
+  private releaseWebConverted(shareId: string): void {
+    const workDir = DynamicPhotoBridge.workDir(this.context);
+    const drop: string[] = [];
+    this.webConverted.forEach((item: WebConvertedShare, key: string): void => {
+      if (key.startsWith(shareId + '|') || item.companionId === shareId) {
+        drop.push(key);
+      }
+    });
+    for (const key of drop) {
+      const item = this.webConverted.get(key);
+      this.webConverted.delete(key);
+      if (item === undefined || !item.path.startsWith(workDir)) {
+        continue;
+      }
+      try {
+        fs.unlinkSync(item.path);
+      } catch (error) {
+        Lg.w('[WEB] drop converted file failed: ' + item.path + ' '
+          + (error instanceof Error ? error.message : JSON.stringify(error)));
+      }
+    }
   }
 
   async start(): Promise<void> {
+    if (this.startOperation !== undefined) {
+      await this.startOperation;
+    }
     if (this.started) {
       return;
     }
     this.started = true;
+    const generation: number = ++this.generation;
+    const operation: Promise<void> = this.startOwned(generation);
+    this.startOperation = operation;
     try {
-      LocalSendServer.actualPort = PORT;
+      await operation;
+    } finally {
+      if (this.startOperation === operation) {
+        this.startOperation = undefined;
+      }
+    }
+  }
+
+  private isCurrent(generation: number): boolean {
+    return this.started && generation === this.generation;
+  }
+
+  private async startOwned(generation: number): Promise<void> {
+    await this.closeOperation;
+    if (!this.isCurrent(generation)) {
+      return;
+    }
+    try {
+      LocalSendServer.actualPort = 0;
+      LocalSendServer.actualWebPort = 0;
       // 若开启加密，优先提供原生 mbedTLS HTTPS（避免 @ohos.net.socket TLSSocket 的 memcpy_s bug）。
-      if ((SettingsStore.current().encryptionEnabled ?? true) && await this.tryStartTls()) {
+      if ((SettingsStore.current().encryptionEnabled ?? true) && await this.tryStartTls(generation)) {
         Lg.i(`羊绒互传 LocalSend server listening on ${PORT} (https)`);
       } else {
-        await this.startPlain();
+        if (!this.isCurrent(generation)) {
+          return;
+        }
+        await this.startPlain(generation);
         Lg.i(`羊绒互传 LocalSend server listening on ${PORT} (http)`);
       }
+      if (!this.isCurrent(generation)) {
+        return;
+      }
+      LocalSendServer.actualPort = PORT;
       // 网页端「局域网网页传输」始终以明文 HTTP 单独提供（即使主端口走 HTTPS），
-      // 让对端浏览器无需处理自签证书。失败不阻塞主服务。
+      // 让对端浏览器无需处理自签证书。端口必须与 Quick Share 接收端口（53318）区分开
+      // （见 WEB_PORT 注释）；首选端口被占用时 startWebListener 内部会依次回退，
+      // 全部失败也只影响网页端，不阻塞主服务。
       try {
-        await this.startWebListener();
+        await this.startWebListener(generation);
       } catch (error) {
         Lg.w('羊绒互传 LocalSend web listener start failed: ' + JSON.stringify(error));
       }
-      this.startSweep();
+      if (this.isCurrent(generation)) {
+        this.startSweep();
+      }
     } catch (error) {
+      if (!this.isCurrent(generation)) {
+        return;
+      }
       this.started = false;
       this.httpsActiveValue = false;
       LocalSendServer.lastHttpsActive = false;
-      LocalSendServer.actualPort = PORT;
+      LocalSendServer.actualPort = 0;
+      LocalSendServer.actualWebPort = 0;
       Lg.e(`羊绒互传 LocalSend server start failed: ${JSON.stringify(error)}`);
+      throw error as Error;
     }
   }
 
   /** 原生 mbedTLS 服务端：socket 由 native 用 POSIX listen/accept 创建(可用)，每连接把 fd 交给
    *  native 做 TLS 握手。native 独占 fd，避免 @ohos.net.socket 事件循环与 mbedTLS 争抢。失败返回 false 走明文。 */
-  private async tryStartTls(): Promise<boolean> {
+  private async tryStartTls(generation: number): Promise<boolean> {
     try {
       const material = await this.certs.ensure();
       if (material === undefined) {
@@ -399,9 +540,17 @@ export class LocalSendServer {
       }
       const certPem = await fs.readText(material.certPath);
       const keyPem = await fs.readText(material.keyPath);
+      if (!this.isCurrent(generation)) {
+        return false;
+      }
       const listenHandle = tlsNative.listen(PORT, { certPem: certPem, keyPem: keyPem },
         (fd: number, peerIp: string): void => {
-          this.handleConnection(new TlsServerConnection(fd, certPem, keyPem, peerIp));
+          const conn: TlsServerConnection = new TlsServerConnection(fd, certPem, keyPem, peerIp);
+          if (this.isCurrent(generation)) {
+            this.handleConnection(conn);
+          } else {
+            conn.close();
+          }
         }) as number | null | undefined;
       if (listenHandle === undefined || listenHandle === null || listenHandle <= 0) {
         Lg.w('羊绒互传 LocalSend TLS listen failed');
@@ -420,13 +569,12 @@ export class LocalSendServer {
   }
 
   stop(): void {
-    if (!this.started) {
-      return;
-    }
+    this.generation += 1;
     this.started = false;
     this.httpsActiveValue = false;
     LocalSendServer.lastHttpsActive = false;
-    LocalSendServer.actualPort = PORT;
+    LocalSendServer.actualPort = 0;
+    LocalSendServer.actualWebPort = 0;
     this.stopSweep();
     if (this.listenHandle > 0) {
       tlsNative.stopListen(this.listenHandle);
@@ -434,40 +582,91 @@ export class LocalSendServer {
     }
     if (this.tcpServer !== undefined) {
       this.tcpServer.off('connect');
-      this.tcpServer.close().catch(() => undefined);
+      const closing: Promise<void> = this.tcpServer.close().catch((): void => undefined);
+      this.closeOperation = Promise.all([this.closeOperation, closing]).then((): void => undefined);
       this.tcpServer = undefined;
     }
     if (this.webTcpServer !== undefined) {
       this.webTcpServer.off('connect');
-      this.webTcpServer.close().catch(() => undefined);
+      const closing: Promise<void> = this.webTcpServer.close().catch((): void => undefined);
+      this.closeOperation = Promise.all([this.closeOperation, closing]).then((): void => undefined);
       this.webTcpServer = undefined;
     }
     if (this.sessions.size > 0) {
       Lg.w('羊绒互传 LocalSend stopping with ' + this.sessions.size + ' sessions in flight');
-      this.sessions.clear();
+      for (const id of Array.from(this.sessions.keys())) {
+        this.failSession(id, '接收服务已停止');
+      }
+    }
+    // 先把改写产物连同共享一起释放（伴侣共享也在 shares 里），再清空共享表。
+    const sharedIds: string[] = [];
+    this.shares.forEach((s: ShareState, id: string): void => {
+      sharedIds.push(id);
+    });
+    for (const id of sharedIds) {
+      this.releaseWebConverted(id);
     }
     this.shares.clear();
+    this.webConverted.clear();
   }
 
-  private async startPlain(): Promise<void> {
+  private async startPlain(generation: number): Promise<void> {
     const server = socket.constructTCPSocketServerInstance();
+    this.tcpServer = server;
     server.on('connect', (conn: socket.TCPSocketConnection): void => {
-      this.handleConnection(new TcpServerConnection(conn));
+      if (this.isCurrent(generation)) {
+        this.handleConnection(new TcpServerConnection(conn));
+      } else {
+        conn.close().catch((): void => undefined);
+      }
     });
     await server.listen({ address: '0.0.0.0', family: 1, port: PORT });
-    this.tcpServer = server;
+    if (!this.isCurrent(generation)) {
+      await server.close().catch((): void => undefined);
+    }
   }
 
   /** 网页端「局域网网页传输」：在独立端口用明文 HTTP 监听，同一套会话/落盘管线复用，
-   *  但浏览器始终通过 http:// 访问，不涉及自签证书。 */
-  private async startWebListener(): Promise<void> {
-    const server = socket.constructTCPSocketServerInstance();
-    server.on('connect', (conn: socket.TCPSocketConnection): void => {
-      this.handleConnection(new TcpServerConnection(conn));
-    });
-    await server.listen({ address: '0.0.0.0', family: 1, port: WEB_PORT });
-    this.webTcpServer = server;
-    Lg.i(`羊绒互传 LocalSend web page listening on ${WEB_PORT} (http)`);
+   *  但浏览器始终通过 http:// 访问，不涉及自签证书。
+   *  首选端口被别的进程占用时按 WEB_PORT_CANDIDATES 依次回退，成功即把实际端口写回
+   *  actualWebPort（UI 上的访问地址由它生成）；全部失败则置 0 并明确报错。 */
+  private async startWebListener(generation: number): Promise<void> {
+    for (let i = 0; i < WEB_PORT_CANDIDATES.length; i++) {
+      if (!this.isCurrent(generation)) {
+        return;
+      }
+      const candidate: number = WEB_PORT_CANDIDATES[i];
+      const server = socket.constructTCPSocketServerInstance();
+      server.on('connect', (conn: socket.TCPSocketConnection): void => {
+        if (this.isCurrent(generation)) {
+          this.handleConnection(new TcpServerConnection(conn));
+        } else {
+          conn.close().catch((): void => undefined);
+        }
+      });
+      try {
+        await server.listen({ address: '0.0.0.0', family: 1, port: candidate });
+        if (!this.isCurrent(generation)) {
+          await server.close().catch((): void => undefined);
+          return;
+        }
+        this.webTcpServer = server;
+        LocalSendServer.actualWebPort = candidate;
+        if (candidate === WEB_PORT) {
+          Lg.i(`羊绒互传 LocalSend web page listening on ${candidate} (http)`);
+        } else {
+          Lg.w('羊绒互传 LocalSend web page 首选端口 ' + WEB_PORT + ' 被占用，已回退到 ' + candidate + ' (http)');
+        }
+        return;
+      } catch (error) {
+        server.off('connect');
+        server.close().catch((): void => undefined);
+        Lg.w('羊绒互传 LocalSend web page listen failed on ' + candidate + ': ' + JSON.stringify(error));
+      }
+    }
+    LocalSendServer.actualWebPort = 0;
+    Lg.e('羊绒互传 局域网网页传输监听失败：端口 ' + WEB_PORT_CANDIDATES.join('/')
+      + ' 全部被占用，网页端将无法访问（Quick Share 接收不受影响，其 53318 未被动用）');
   }
 
   private startSweep(): void {
@@ -489,7 +688,7 @@ export class LocalSendServer {
     this.sessions.forEach((session: SessionState, id: string): void => {
       if (session.expiresAt <= now) {
         Lg.w('羊绒互传 LocalSend session expired: ' + id + ' (ttl=' + SESSION_TTL_MS + 'ms) removed');
-        this.sessions.delete(id);
+        this.failSession(id, '接收会话已超时');
       }
     });
     this.pruneExpiredShares();
@@ -500,6 +699,16 @@ export class LocalSendServer {
     if (session !== undefined) {
       session.expiresAt = Date.now() + SESSION_TTL_MS;
     }
+  }
+
+  private failSession(id: string, reason: string): void {
+    const session: SessionState | undefined = this.sessions.get(id);
+    if (session === undefined || session.failed === true) {
+      return;
+    }
+    session.failed = true;
+    this.sessions.delete(id);
+    this.handler?.onSessionFailed?.(id, reason);
   }
 
   private handleConnection(conn: ServerConnection): void {
@@ -518,7 +727,6 @@ export class LocalSendServer {
     let doneTimer = -1;
     let mpDelimBytes: Uint8Array = new Uint8Array(0);
     let mpScanPos = 0;
-    let sniffCompacted = false;
     const mpFields: MpScan = { sessionId: '', fileId: '', token: '' };
     const clearTimers = (): void => {
       if (idleTimer >= 0) {
@@ -530,14 +738,14 @@ export class LocalSendServer {
         doneTimer = -1;
       }
     };
-    const settle = (respond: boolean, status: number, body: string): void => {
+    const settle = (respond: boolean, status: number, body: string, framed: boolean = true): void => {
       if (stream === undefined || handled) {
         return;
       }
       handled = true;
       clearTimers();
       const session = this.sessions.get(stream.sessionId);
-      let incomplete = false;
+      const incomplete = !framed || session === undefined || stream.received !== stream.total;
       if (session !== undefined) {
         try {
           // 只记录长度，不打印文件内容（避免泄露接收到的文件字节）。
@@ -545,40 +753,20 @@ export class LocalSendServer {
         } catch (readError) {
           Lg.w('LocalSend file check failed: ' + JSON.stringify(readError));
         }
-        if (stream.total > 0 && stream.received > stream.total) {
-          try {
-            fs.truncateSync(stream.file.fd, stream.total);
-            stream.received = stream.total;
-            Lg.w('LocalSend upload truncated to declared size: ' + stream.total + ' (raw excess removed)');
-          } catch (truncError) {
-            Lg.w('LocalSend upload truncate failed: ' + JSON.stringify(truncError));
-          }
-        }
-        const expected = stream.total > 0 ? stream.total : (contentLength > 0 ? contentLength : stream.received);
-        incomplete = stream.received < expected;
-        if (incomplete) {
-          if (stream.received === 0) {
-            Lg.w('羊绒互传 LocalSend upload incomplete: 0 bytes received (abandoned), removing ' + stream.path);
-            try {
-              fs.unlinkSync(stream.path);
-            } catch (unlinkError) {
-              Lg.w('羊绒互传 LocalSend upload cleanup failed: ' + JSON.stringify(unlinkError));
-            }
-          } else {
-            Lg.w('羊绒互传 LocalSend upload incomplete: ' + stream.received + '/' + expected + ' bytes -> ' + stream.path + ' (partial file kept)');
-          }
-        } else {
+        session.activeFiles.delete(stream.fileId);
+        if (!incomplete) {
+          session.receivedFiles.add(stream.fileId);
           Lg.i('羊绒互传 LocalSend upload streamed complete: ' + stream.sessionId + ' ' + stream.received + ' bytes -> ' + stream.path);
-        }
-        session.activeStreams -= 1;
-        session.completed += 1;
-        if (session.activeStreams <= 0 && session.completed >= session.files.size) {
-          this.sessions.delete(stream.sessionId);
         }
       }
       this.closeStream(stream);
+      if (incomplete) {
+        LocalSendServer.removePartial(stream.path);
+        this.failSession(stream.sessionId, '文件接收不完整：' + stream.received + '/' + stream.total + ' 字节');
+      }
       if (respond) {
-        conn.sendBytes(LocalSendServer.encodeResponse(status, body)).then(() => {
+        conn.sendBytes(LocalSendServer.encodeResponse(incomplete ? 400 : status,
+          incomplete ? '{"status":"incomplete-upload"}' : body)).then(() => {
           conn.close();
         }).catch(() => {
           conn.close();
@@ -587,18 +775,10 @@ export class LocalSendServer {
         conn.close();
       }
       if (session !== undefined) {
-        if (incomplete && stream.received === 0) {
-          if (this.handler !== undefined) {
-            // 空残缺已删除，仅用 onProgress(100) 收尾任务，不报文件
-            this.handler.onProgress(stream.sessionId, 100);
-          }
-        } else if (incomplete) {
-          if (this.handler !== undefined) {
-            this.handler.onFileReceived(stream.sessionId, { name: stream.name, size: stream.received, savedPath: stream.path });
-            this.handler.onProgress(stream.sessionId, 100);
-          }
-        } else {
-          void this.reportReceived(stream, session, session.files.size === 1);
+        if (!incomplete) {
+          this.reportReceived(stream, session, session.files.size === 1).catch((error: Error): void => {
+            this.failSession(stream?.sessionId ?? '', '保存接收文件失败：' + error.message);
+          });
         }
       }
     };
@@ -611,9 +791,13 @@ export class LocalSendServer {
       }
       idleTimer = setTimeout((): void => {
         idleTimer = -1;
-        if (!handled && stream !== undefined) {
-          Lg.w('羊绒互传 LocalSend upload idle, settling partial stream');
-          settle(false, 0, '');
+        if (!handled) {
+          if (stream !== undefined) {
+            Lg.w('羊绒互传 LocalSend upload idle, settling partial stream');
+            settle(false, 0, '', mode === 'raw' && (contentLength === 0 || stream.received === contentLength));
+          } else {
+            respondAndClose(408, '{"status":"request-timeout"}');
+          }
         }
       }, IDLE_SETTLE_MS);
     };
@@ -646,9 +830,11 @@ export class LocalSendServer {
       });
     };
     conn.onData((chunk: Uint8Array) => {
+      try {
       if (handled) {
         return;
       }
+      armIdle();
       if (!headParsed) {
         buffer = ByteUtils.concat([buffer, chunk]);
         const headerEnd = ByteUtils.indexOf(buffer, CRLF_CRLF, 0);
@@ -658,33 +844,41 @@ export class LocalSendServer {
           }
           return;
         }
+        if (headerEnd > MAX_HEAD_BYTES) {
+          respondAndClose(431, '{"status":"head-too-large"}');
+          return;
+        }
         headText = ByteUtils.decodeText(buffer.slice(0, headerEnd));
         bodyStart = headerEnd + 4;
         contentLength = LocalSendServer.readContentLength(headText);
+        if (contentLength < 0) {
+          respondAndClose(400, '{"status":"invalid-content-length"}');
+          return;
+        }
         const head = LocalSendServer.parseRequest(headText, new Uint8Array(0));
         transferEncoding = (head.headers.get('transfer-encoding') ?? '').toLowerCase();
         claimsChunked = transferEncoding.indexOf('chunked') >= 0;
-        const contentType = (head.headers.get('content-type') ?? '').toLowerCase();
+        const contentType: string = head.headers.get('content-type') ?? '';
         headQuery = head.query;
+        const isUpload = LocalSendServer.isUploadPath(head.path);
+        if (isUpload && head.method !== 'POST') {
+          respondAndClose(405, '{"status":"method-not-allowed"}');
+          return;
+        }
         const expectContinue = (head.headers.get('expect') ?? '').toLowerCase() === '100-continue';
         Lg.i('LocalSend http head: ' + head.method + ' ' + head.path + ' cl=' + contentLength + ' te=' + (transferEncoding.length > 0 ? transferEncoding : '-') + ' ct=' + (contentType.length > 0 ? contentType : '-'));
         if (expectContinue) {
           conn.sendBytes(LocalSendServer.encodeContinue()).catch((): void => undefined);
         }
         if (claimsChunked) {
-          if (!LocalSendServer.isUploadPath(head.path)) {
+          if (!isUpload) {
             Lg.w('LocalSend chunked body on non-upload path rejected: ' + head.path);
             respondAndClose(415, '{"status":"unsupported-media-type"}');
             return;
           }
           mode = 'sniff';
-        } else if (LocalSendServer.isUploadPath(head.path)) {
-          if (head.method !== 'POST') {
-            Lg.w('LocalSend upload rejected: method ' + head.method + ' not allowed');
-            respondAndClose(405, '{"status":"method-not-allowed"}');
-            return;
-          }
-          if (contentType.indexOf('multipart/form-data') >= 0) {
+        } else if (isUpload) {
+          if (contentType.toLowerCase().indexOf('multipart/form-data') >= 0) {
             const boundaryText = LocalSendServer.readBoundary(contentType);
             if (boundaryText.length === 0) {
               Lg.w('LocalSend multipart upload missing boundary, rejected');
@@ -692,6 +886,7 @@ export class LocalSendServer {
               return;
             }
             mpDelimBytes = ByteUtils.encodeText('--' + boundaryText);
+            mpScanPos = bodyStart;
             mode = 'mp';
           } else {
             if (contentLength > MAX_BODY_BYTES) {
@@ -705,11 +900,19 @@ export class LocalSendServer {
               respondAndClose(401, '{"status":"unauthorized"}');
               return;
             }
+            if (opened === 'duplicate') {
+              respondAndClose(409, '{"status":"duplicate-upload"}');
+              return;
+            }
             if (opened === 'error') {
               respondAndClose(500, '{"status":"error"}');
               return;
             }
             stream = opened;
+            if (head.headers.has('content-length') && contentLength !== stream.total) {
+              settle(true, 400, '', false);
+              return;
+            }
             Lg.i('LocalSend raw (content-length) upload started: ' + stream.sessionId + ' ' + stream.name + ' -> ' + stream.path + ' cl=' + contentLength);
             const residual = buffer.length > bodyStart ? buffer.slice(bodyStart) : new Uint8Array(0);
             if (residual.length > 0) {
@@ -745,7 +948,7 @@ export class LocalSendServer {
         }
         const session = this.sessions.get(stream.sessionId);
         if (session === undefined) {
-          settle(false, 0, '');
+          settle(false, 0, '', false);
           return;
         }
         this.touchSession(stream.sessionId);
@@ -754,7 +957,7 @@ export class LocalSendServer {
           settle(true, 200, '{"status":"ok"}');
           return;
         }
-        if (stream.total > 0 && stream.received >= stream.total) {
+        if (contentLength === 0 && stream.received >= stream.total) {
           armDone();
           return;
         }
@@ -784,6 +987,10 @@ export class LocalSendServer {
         if (opened === 'unauthorized') {
           Lg.w('LocalSend upload 401: session missing or token mismatch id=' + sessionId);
           respondAndClose(401, '{"status":"unauthorized"}');
+          return;
+        }
+        if (opened === 'duplicate') {
+          respondAndClose(409, '{"status":"duplicate-upload"}');
           return;
         }
         if (opened === 'error') {
@@ -826,70 +1033,20 @@ export class LocalSendServer {
           return;
         }
         this.touchSession(stream.sessionId);
-        const parsed = this.consumeChunked(buffer, stream);
-        if (parsed === -1) {
-          Lg.w('LocalSend raw fallback: switching from chunked to raw (received=' + stream.received + ')');
-          if (!sniffCompacted) {
-            // 缓冲仍覆盖 bodyStart 起的全部内容：truncate 后整体按 raw 重写
-            try {
-              fs.truncateSync(stream.file.fd, 0);
-              fs.lseek(stream.file.fd, 0, fs.WhenceType.SEEK_SET);
-            } catch (truncError) {
-              Lg.w('LocalSend raw fallback: truncate failed ' + JSON.stringify(truncError));
-            }
-            stream.received = 0;
-            stream.lastPct = -1;
-            stream.chunkSize = -1;
-            this.writeRawData(session, stream, buffer.slice(bodyStart));
-          } else {
-            // 缓冲已压实无法重建前缀：仅剩余内容按 raw 追加
-            Lg.w('LocalSend raw fallback: buffer compacted, appending raw tail from pos=' + stream.pos);
-            this.writeRawData(session, stream, buffer.slice(stream.pos));
-          }
-          mode = 'raw';
-          if (contentLength > 0 && stream.received >= contentLength) {
-            settle(true, 200, '{"status":"ok"}');
-          } else if (stream.total > 0 && stream.received >= stream.total) {
-            armDone();
-          } else {
-            armIdle();
-          }
-          return;
-        } else if (parsed === -2) {
-          Lg.w('LocalSend chunked: writing raw tail from pos=' + stream.pos + ' (received=' + stream.received + ')');
-          this.writeRawData(session, stream, buffer.slice(stream.pos));
-          mode = 'raw';
-          if (contentLength > 0 && stream.received >= contentLength) {
-            settle(true, 200, '{"status":"ok"}');
-          } else if (stream.total > 0 && stream.received >= stream.total) {
-            armDone();
-          } else {
-            armIdle();
-          }
-          return;
-        } else if (parsed === 0) {
-          const streamTotal = stream.total > 0 ? stream.total : session.totalBytes;
-          if (stream.received > streamTotal + MAX_OVERREAD_BYTES) {
-            Lg.w('LocalSend chunked: overread limit reached (' + stream.received + ' > ' + streamTotal + '), aborting');
-            this.releaseStream(stream);
-            respondAndClose(500, '{"status":"error"}');
-            return;
-          }
-          if (stream.pos >= 1024 * 1024) {
-            buffer = buffer.slice(stream.pos);
-            stream.pos = 0;
-            sniffCompacted = true;
-          }
-          if (stream.total > 0 && stream.received >= stream.total) {
-            armDone();
-          } else {
-            armIdle();
-          }
-          return;
-        } else {
+        const parsed = this.consumeChunked(buffer, stream, session);
+        if (parsed === 1) {
           settle(true, 200, '{"status":"ok"}');
           return;
         }
+        if (parsed === -1) {
+          settle(true, 400, '', false);
+          return;
+        }
+        if (stream.pos > 0) {
+          buffer = buffer.slice(stream.pos);
+          stream.pos = 0;
+        }
+        return;
       }
       if (mode === 'mp') {
         if (mpDelimBytes.length === 0) {
@@ -924,44 +1081,38 @@ export class LocalSendServer {
             respondAndClose(401, '{"status":"unauthorized"}');
             return;
           }
+          if (opened === 'duplicate') {
+            respondAndClose(409, '{"status":"duplicate-upload"}');
+            return;
+          }
           if (opened === 'error') {
             respondAndClose(500, '{"status":"error"}');
             return;
           }
           stream = opened;
-          if (result.fileName.length > 0) {
-            stream.name = result.fileName;
-          }
           stream.pos = result.fileDataStart;
-          stream.mpDelim = mpDelimBytes;
-          stream.mpPhase = 1;
+          stream.mpDelim = ByteUtils.concat([CRLF, mpDelimBytes]);
           Lg.i('LocalSend multipart upload started: ' + stream.sessionId + ' ' + stream.name + ' -> ' + stream.path);
         }
         const sessionForStream = this.sessions.get(stream.sessionId);
         if (sessionForStream === undefined) {
-          settle(false, 0, '');
+          settle(false, 0, '', false);
           return;
         }
         this.touchSession(stream.sessionId);
-        const parsed = this.consumeMultipart(buffer, stream);
+        const parsed = this.consumeMultipart(buffer, stream, sessionForStream);
         if (parsed === 1) {
           settle(true, 200, '{"status":"ok"}');
           return;
         }
         if (parsed === -1) {
-          Lg.w('LocalSend multipart: framing broken, settling partial (received=' + stream.received + ')');
-          settle(false, 0, '');
+          settle(true, 400, '', false);
           return;
         }
         if (stream.pos >= 1024 * 1024) {
           buffer = buffer.slice(stream.pos);
           stream.pos = 0;
           bodyStart = 0;
-        }
-        if (stream.total > 0 && stream.received >= stream.total) {
-          armDone();
-        } else {
-          armIdle();
         }
         return;
       }
@@ -972,26 +1123,37 @@ export class LocalSendServer {
       clearTimers();
       const request = LocalSendServer.parseRequest(headText, buffer.slice(bodyStart, bodyStart + contentLength));
       this.route(request, conn);
+      } catch (error) {
+        Lg.e('LocalSend receive I/O failed: ' + JSON.stringify(error));
+        if (stream !== undefined) {
+          this.releaseStream(stream);
+        }
+        respondAndClose(500, '{"status":"write-failed"}');
+      }
     });
     conn.onClose((): void => {
       clearTimers();
       if (!handled && stream !== undefined) {
         Lg.i('羊绒互传 LocalSend upload connection closed, settling stream (mode=' + mode + ' received=' + stream.received + ')');
-        settle(false, 0, '');
+        settle(false, 0, '', mode === 'raw' && (contentLength === 0 || stream.received === contentLength));
       }
     });
+    armIdle();
   }
 
   private releaseStream(state: StreamState): void {
     const session = this.sessions.get(state.sessionId);
     if (session !== undefined) {
-      session.activeStreams -= 1;
-      session.completed += 1;
-      if (session.activeStreams <= 0 && session.completed >= session.files.size) {
-        this.sessions.delete(state.sessionId);
-      }
+      session.activeFiles.delete(state.fileId);
+      this.failSession(state.sessionId, '接收文件流失败');
     }
     this.closeStream(state);
+    LocalSendServer.removePartial(state.path);
+  }
+
+  private static removePartial(path: string): void {
+    try { fs.unlinkSync(path); }
+    catch (error) { Lg.w('LocalSend partial cleanup failed: ' + JSON.stringify(error)); }
   }
 
   private route(request: ParsedRequest, conn: ServerConnection): void {
@@ -1037,12 +1199,15 @@ export class LocalSendServer {
     }
     if (request.method === 'POST') {
       if (path === '/api/localsend/v2/register' || path === '/api/localsend/v1/register' || path === '/api/register') {
+        // 先上报对端信号再应答：对端能 POST 到这里，说明它已经发现了本机（announce 生效）。
+        await this.notifyPeerSignal(request, conn, 'register');
         await conn.sendBytes(LocalSendServer.encodeResponse(200, await this.infoJson()));
         return;
       }
       if (path === '/api/localsend/v2/cancel' || path === '/api/localsend/v1/cancel') {
         const sessionId = request.query.get('sessionId') ?? '';
-        Lg.i('羊绒互传 LocalSend cancel: session ' + sessionId + ' removed=' + this.sessions.delete(sessionId));
+        this.failSession(sessionId, '对端已取消传输');
+        Lg.i('羊绒互传 LocalSend cancel: session ' + sessionId);
         await conn.sendBytes(LocalSendServer.encodeResponse(200, '{}'));
         return;
       }
@@ -1060,6 +1225,58 @@ export class LocalSendServer {
       }
     }
     await conn.sendBytes(LocalSendServer.encodeResponse(404, '{"status":"not-found"}'));
+  }
+
+  /**
+   * 把 register / send-request 请求体里的对端身份连同来源 IP 上报给发现链路。
+   *
+   * 真机日志（2026-09-20，热点模式）：对端收到本机 announce 后 400ms 内就发来 /register，
+   * 说明「对端能发现本机」这条路是通的 —— 此前这个信号只回了个 200 就扔掉了，
+   * 本机设备列表毫无感知。体解析失败/字段缺失时仍然上报（至少有 IP 供子网探测兜底）。
+   */
+  private async notifyPeerSignal(request: ParsedRequest, conn: ServerConnection, via: string): Promise<void> {
+    if (LocalSendServer.onPeerSignal === undefined) {
+      return;
+    }
+    try {
+      const peerIp = await conn.peerAddress();
+      if (peerIp.length === 0) {
+        return;
+      }
+      let alias = '';
+      let deviceModel = '';
+      let fingerprint = '';
+      let port = 0;
+      let protocol = '';
+      try {
+        const json = JSON.parse(ByteUtils.decodeText(request.body)) as PeerInfoJson;
+        alias = json.alias ?? '';
+        deviceModel = json.deviceModel ?? '';
+        fingerprint = json.fingerprint ?? '';
+        port = json.port ?? 0;
+        protocol = json.protocol ?? '';
+      } catch (error) {
+        // 非 JSON 体：仅凭来源 IP 上报。
+      }
+      if (alias.length === 0 && fingerprint.length === 0) {
+        return; // 连个身份都没有，多半不是 LocalSend 对端。
+      }
+      if (port <= 0 || port > 65535) {
+        port = LocalSendServer.actualPort;
+      }
+      Lg.i('羊绒互传 LocalSend peer signal via ' + via + ' from ' + peerIp + ':' + port
+        + ' alias=' + alias + ' model=' + deviceModel);
+      LocalSendServer.onPeerSignal({
+        address: peerIp,
+        alias: alias.length > 0 ? alias : peerIp,
+        deviceModel: deviceModel.length > 0 ? deviceModel : 'LocalSend device',
+        fingerprint: fingerprint,
+        port: port,
+        protocol: protocol
+      });
+    } catch (error) {
+      Lg.w('羊绒互传 LocalSend peer signal failed: ' + JSON.stringify(error));
+    }
   }
 
   /** 浏览器「局域网网页传输」页面：从 rawfile 读取并缓存 HTML 内容。 */
@@ -1084,40 +1301,74 @@ export class LocalSendServer {
       return;
     }
     this.pruneExpiredShares();
-    const share = this.shares.get(id);
-    if (share === undefined) {
+    const registered = this.shares.get(id);
+    if (registered === undefined) {
       Lg.w('羊绒互传 web download 404: id=' + id);
       await conn.sendBytes(LocalSendServer.encodeResponse(404, '{"status":"not-found"}'));
       return;
     }
+    // 网页端没有 LocalSend 发现信息，只有请求头里的 User-Agent —— 用它识别对端设备，
+    // 再决定发哪种动态照片/HDR 形态（不然 OPPO 浏览器下到的是鸿蒙形态的文件，相册不认）。
+    const share = await this.shareForBrowser(registered, id, request.headers.get('user-agent') ?? '');
     let fd = -1;
+    // 提到 try 外面：失败日志要带上「已经发出去多少字节」——真机踩过「浏览器第一次请求中断，
+    // 用户打开的是半截文件」，而半截文件正好会「既没有 HDR 又没有动图」（增益图与视频都在尾部）。
+    let sent = 0;
+    let total = share.size;
     try {
       fd = fs.openSync(share.path, fs.OpenMode.READ_ONLY).fd;
+      // 以**打开的 fd 的真实大小**为准：登记大小取自选择器返回 URI 的 stat，可能与实际可读字节数
+      // 不一致（实测：HEIC 登记 1 832 802，实际可读 1 835 008+；28 MB 的文件只读到 2.5 MB）。
+      // 按登记大小写 Content-Length 会让浏览器一直等剩下的字节 → 下载失败/连接重置（真实 bug）。
+      total = share.size;
+      try {
+        const stat = fs.statSync(fd);
+        if (stat.size > 0) {
+          total = stat.size;
+        }
+      } catch (statError) {
+        Lg.w('web download fstat failed, fall back to registered size: '
+          + (statError instanceof Error ? statError.message : JSON.stringify(statError)));
+      }
+      if (total !== share.size) {
+        Lg.w('web download size mismatch: registered=' + share.size + ' actual=' + total
+          + ' name=' + share.name);
+      }
       const safeName = share.name.replace(/["\\\r\n]/g, '_');
+      // 用已打开文件的长度检查完整性。中途读不到剩余数据时不发送结束块，
+      // 让浏览器把这次下载视为中断。
       const head = 'HTTP/1.1 200 OK\r\n' +
         'Content-Type: application/octet-stream\r\n' +
         'Content-Disposition: attachment; filename="' + safeName + '"\r\n' +
-        'Content-Length: ' + share.size + '\r\n' +
+        'Transfer-Encoding: chunked\r\n' +
         'Connection: close\r\n\r\n';
       await conn.sendBytes(ByteUtils.encodeText(head));
-      const buf = new ArrayBuffer(256 * 1024);
-      let sent = 0;
-      while (true) {
-        const n = fs.readSync(fd, buf);
+      const chunkSize = 256 * 1024;
+      const buf = new ArrayBuffer(chunkSize);
+      while (sent < total) {
+        const take = Math.min(chunkSize, total - sent);
+        // 显式给 offset/length：不依赖 fd 的隐式游标，也就不会出现「多读一块撑破 Content-Length」。
+        const n = fs.readSync(fd, buf, { offset: sent, length: take });
         if (n <= 0) {
           break;
         }
-        sent += n;
-        if (sent > share.size) {
-          break;
-        }
-        // sendBytes 需要 Uint8Array；TLS/TCP 内部会再转成全新 ArrayBuffer 发送，
-        // 这里直接传 Uint8Array 即可（不要用 toArrayBuffer，它会返回 ArrayBuffer）。
+        await conn.sendBytes(ByteUtils.encodeText(n.toString(16) + '\r\n'));
         await conn.sendBytes(new Uint8Array(buf.slice(0, n)));
+        await conn.sendBytes(ByteUtils.encodeText('\r\n'));
+        sent += n;
       }
-      Lg.i('羊绒互传 web download complete: ' + id + ' sent=' + sent + '/' + share.size);
+      if (sent !== total) {
+        throw new Error('共享文件未完整读取：' + sent + '/' + total);
+      }
+      await conn.sendBytes(ByteUtils.encodeText('0\r\n\r\n'));
+      Lg.i('羊绒互传 web download complete: ' + id + ' sent=' + sent + '/' + total
+        + ' name=' + share.name);
     } catch (error) {
-      Lg.w('羊绒互传 web download failed: ' + JSON.stringify(error));
+      // 带上已发送字节数：真机踩过「浏览器第一次请求中断（Broken pipe），用户打开的是半截文件」，
+      // 而日志里只有一句失败，看不出到底传了多少 —— 半截文件正好会「既没有 HDR 又没有动图」
+      // （增益图与视频都在文件尾部）。
+      Lg.w('羊绒互传 web download failed: ' + JSON.stringify(error)
+        + ' sent=' + sent + '/' + total + ' name=' + share.name);
     } finally {
       if (fd >= 0) {
         try {
@@ -1129,10 +1380,93 @@ export class LocalSendServer {
     }
   }
 
+  /**
+   * 按**浏览器 UA** 识别对端设备，把共享文件改写成它认的动态照片/HDR 形态。
+   *
+   * 背景：网页端（浏览器）不走 LocalSend 发现，拿不到设备名/型号，唯一的线索就是请求头里的
+   * `User-Agent`。而动态图片各家格式不通用 —— 直接把鸿蒙形态的图片给 OPPO 浏览器，对方相册
+   * 既不认动态照片也不认 HDR。这里复用发送侧同一条改写链路
+   * （`DynamicPhotoService.prepareOutgoing` + `HdrPhotoService`），决策来源换成 UA。
+   *
+   * 行为约定（宁可不改，也不要猜错）：
+   *  - UA 判为桌面/鸿蒙/认不出 → **原样发文件**（`format === 'split'`）；
+   *  - UA 判为某家 Android → 单文件动态照片 + 该家私有方言；判为 iOS/macOS → 实况照片那对
+   *    （JPEG 为主文件、MOV 登记成伴侣共享，页面列表刷新后即可下载）；
+   *  - 文件本身不是动态照片时 `prepareOutgoing` 原样返回 → 也走原样发；
+   *  - 结果按「共享 id + 格式 + 方言」缓存，同一个文件不重复转换。
+   */
+  private async shareForBrowser(share: ShareState, requestId: string, userAgent: string): Promise<ShareState> {
+    const decision: PeerDecision = PeerLivePhotoFormat.resolveForUserAgent(userAgent);
+    const trimmedUa = userAgent.length > 160 ? userAgent.substring(0, 160) + '…' : userAgent;
+    Lg.i('[WEB] browser peer: platform=' + decision.platform + ' brand='
+      + (decision.brand.length > 0 ? decision.brand : '-') + ' target=' + decision.format
+      + (decision.format === 'android' ? ' dialect=' + PeerLivePhotoFormat.dialectLabel(decision.dialect) : '')
+      + ' reason=' + decision.reason + ' ua=' + (trimmedUa.length > 0 ? trimmedUa : '-'));
+    if (decision.format === 'split') {
+      return share; // 桌面/鸿蒙/认不出：原样给字节
+    }
+    const key = requestId + '|' + decision.format + '|' + decision.dialect;
+    const cached = this.webConverted.get(key);
+    if (cached !== undefined) {
+      return { id: share.id, path: cached.path, name: cached.name, size: cached.size,
+        addedAt: share.addedAt, expiresAt: share.expiresAt };
+    }
+    try {
+      const source: OutgoingFile = {
+        path: share.path, name: share.name, size: share.size,
+        mime: LocalSendServer.mimeOfName(share.name)
+      };
+      const expanded = await DynamicPhotoService.prepareOutgoing(this.context, [source], decision);
+      if (expanded.length === 0 || expanded[0].path === share.path) {
+        // 不是动态图片（或开关关着、转换失败退回原文件）：原样发，并记一行便于排查。
+        Lg.i('[WEB] browser rewrite not applied (not a dynamic photo or conversion off): ' + share.name);
+        return share;
+      }
+      const primary = expanded[0];
+      let companionId = '';
+      if (expanded.length > 1) {
+        // 两个文件的形态（Apple 实况照片的 JPEG + MOV）：主文件按本次请求发，
+        // 伴侣登记成新的共享项，页面 8 秒自动刷新后会出现在列表里。
+        const extra = expanded[1];
+        companionId = this.addShare(extra.path, extra.name, extra.size);
+        Lg.i('[WEB] browser rewrite companion share: ' + extra.name + ' -> ' + companionId);
+      }
+      this.webConverted.set(key, {
+        path: primary.path, name: primary.name, size: primary.size, companionId: companionId
+      });
+      Lg.i('[WEB] browser rewrite: ' + share.name + ' -> ' + primary.name + ' '
+        + primary.size + ' bytes (target=' + decision.format
+        + (decision.format === 'android' ? ' dialect=' + decision.dialect : '') + ')');
+      return { id: share.id, path: primary.path, name: primary.name, size: primary.size,
+        addedAt: share.addedAt, expiresAt: share.expiresAt };
+    } catch (error) {
+      Lg.w('[WEB] browser rewrite failed, send original: '
+        + (error instanceof Error ? error.message : JSON.stringify(error)));
+      return share;
+    }
+  }
+
+  /** 粗略 MIME：只用于 `prepareOutgoing` 的输入字段，改写器按文件头判类型，不依赖它。 */
+  private static mimeOfName(name: string): string {
+    const lower = name.toLowerCase();
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
+      return 'image/jpeg';
+    }
+    if (lower.endsWith('.heic') || lower.endsWith('.heif')) {
+      return 'image/heic';
+    }
+    if (lower.endsWith('.png')) {
+      return 'image/png';
+    }
+    if (lower.endsWith('.mp4') || lower.endsWith('.mov')) {
+      return 'video/mp4';
+    }
+    return 'application/octet-stream';
+  }
+
   private async infoJson(): Promise<string> {
     const settings = SettingsStore.current();
-    const certFingerprint = await this.certs.fingerprint();
-    const fingerprint = certFingerprint.length > 0 ? certFingerprint : await DeviceIdentity.load(this.context);
+    const fingerprint = await this.certs.discoveryFingerprint(this.httpsActive);
     return JSON.stringify({
       alias: settings.alias,
       version: '2.0',
@@ -1141,7 +1475,7 @@ export class LocalSendServer {
       fingerprint,
       port: LocalSendServer.actualPort,
       protocol: this.httpsActive ? 'https' : 'http',
-      download: true
+      download: false
     });
   }
 
@@ -1158,6 +1492,8 @@ export class LocalSendServer {
     let parsed: SendRequestJson;
     try {
       parsed = JSON.parse(ByteUtils.decodeText(request.body)) as SendRequestJson;
+      // 能发 send-request 说明对端已经知道本机地址：顺手作为发现信号（与 /register 同管线）。
+      await this.notifyPeerSignal(request, conn, 'send-request');
     } catch (error) {
       await conn.sendBytes(LocalSendServer.encodeResponse(400, '{"status":"bad-request"}'));
       return;
@@ -1165,11 +1501,20 @@ export class LocalSendServer {
     const files: Map<string, SessionFileMeta> = new Map();
     const metaList: SessionFileMeta[] = [];
     let totalBytes = 0;
-    if (parsed.files !== undefined) {
+    if (parsed !== null && parsed.files !== undefined && parsed.files !== null
+      && typeof parsed.files === 'object' && !Array.isArray(parsed.files)) {
       const ids = Object.keys(parsed.files);
       for (const id of ids) {
         const info = parsed.files[id];
-        const meta: SessionFileMeta = { id, name: info.fileName, size: info.size };
+        if (id.length === 0 || info === null || typeof info !== 'object'
+          || typeof info.fileName !== 'string' || info.fileName.trim().length === 0
+          || !Number.isSafeInteger(info.size) || info.size < 0
+          || !Number.isSafeInteger(totalBytes + info.size)) {
+          await conn.sendBytes(LocalSendServer.encodeResponse(400, '{"status":"invalid-file-metadata"}'));
+          return;
+        }
+        const meta: SessionFileMeta = { id, name: info.fileName, size: info.size,
+          mime: typeof info.fileType === 'string' ? info.fileType : undefined };
         files.set(id, meta);
         metaList.push(meta);
         totalBytes += info.size;
@@ -1194,16 +1539,24 @@ export class LocalSendServer {
       files,
       receivedBytes: 0,
       totalBytes,
-      activeStreams: 0,
-      completed: 0,
+      activeFiles: new Set<string>(),
+      receivedFiles: new Set<string>(),
+      savedFiles: new Set<string>(),
       expiresAt: Date.now() + SESSION_TTL_MS
     });
-      const peerName = parsed.info !== undefined && parsed.info.alias !== undefined && parsed.info.alias.length > 0
+    const peerName = typeof parsed.info?.alias === 'string' && parsed.info.alias.length > 0
       ? parsed.info.alias : 'LocalSend peer';
-    Lg.i('羊绒互传 LocalSend send-request: peer=' + peerName + ' files=' + metaList.length + ' totalBytes=' + totalBytes);
+    // 网页端（浏览器）只有 UA 能说明它是什么设备：识别出的品牌直接补在对端名后面，
+    // 本机确认弹窗里就能看到「Android 浏览器 · OPPO」而不是干巴巴一个「Android 浏览器」。
+    // 原生 LocalSend 客户端没有浏览器 UA（okhttp/dart 之类）→ 识别为空 → 名字保持不变。
+    const uaDecision: PeerDecision = PeerLivePhotoFormat.resolveForUserAgent(request.headers.get('user-agent') ?? '');
+    const peerLabel = uaDecision.brand.length > 0 && peerName.indexOf(uaDecision.brand) < 0
+      ? peerName + ' · ' + uaDecision.brand : peerName;
+    Lg.i('羊绒互传 LocalSend send-request: peer=' + peerLabel + ' files=' + metaList.length
+      + ' totalBytes=' + totalBytes + (uaDecision.brand.length > 0 ? ' ua-brand=' + uaDecision.brand : ''));
     let accepted = true;
     if (this.handler !== undefined) {
-      accepted = await this.handler.onSessionRequested({ sessionId, peerName, files: metaList, pin });
+      accepted = await this.handler.onSessionRequested({ sessionId, peerName: peerLabel, files: metaList, pin });
     }
     Lg.i('羊绒互传 LocalSend send-request: session ' + sessionId + ' accepted=' + accepted);
     if (!accepted) {
@@ -1249,7 +1602,6 @@ export class LocalSendServer {
     let sessionId = request.query.get('sessionId') ?? '';
     let fileId = request.query.get('fileId') ?? '';
     let token = request.query.get('token') ?? '';
-    let fileName = request.query.get('fileName') ?? '';
     let fileData = request.body;
     const contentType = request.headers.get('content-type') ?? '';
     if (contentType.indexOf('multipart/form-data') >= 0) {
@@ -1263,48 +1615,59 @@ export class LocalSendServer {
           token = ByteUtils.decodeText(field.data);
         } else if (field.name === 'file') {
           fileData = field.data;
-          if (field.fileName.length > 0) {
-            fileName = field.fileName;
-          }
         }
       }
     }
+    const stream = this.tryOpenUploadStream(sessionId, fileId, token);
+    if (stream === 'unauthorized') {
+      await conn.sendBytes(LocalSendServer.encodeResponse(401, '{"status":"unauthorized"}'));
+      return;
+    }
+    if (stream === 'duplicate') {
+      await conn.sendBytes(LocalSendServer.encodeResponse(409, '{"status":"duplicate-upload"}'));
+      return;
+    }
+    if (stream === 'error') {
+      await conn.sendBytes(LocalSendServer.encodeResponse(500, '{"status":"write-failed"}'));
+      return;
+    }
     const session = this.sessions.get(sessionId);
-    if (session === undefined || session.token !== token) {
-      await conn.sendBytes(LocalSendServer.encodeResponse(401, '{"status":"unauthorized"}'));
+    if (session === undefined || fileData.length !== stream.total) {
+      this.releaseStream(stream);
+      await conn.sendBytes(LocalSendServer.encodeResponse(400, '{"status":"incomplete-upload"}'));
       return;
     }
-    if (session.expiresAt <= Date.now()) {
-      this.sessions.delete(sessionId);
-      await conn.sendBytes(LocalSendServer.encodeResponse(401, '{"status":"unauthorized"}'));
+    try {
+      this.writeRawData(session, stream, fileData);
+    } catch (error) {
+      this.releaseStream(stream);
+      await conn.sendBytes(LocalSendServer.encodeResponse(500, '{"status":"write-failed"}'));
       return;
     }
-    const meta = session.files.get(fileId);
-    const effectiveName = fileName.length > 0 ? fileName : (meta !== undefined ? meta.name : fileId);
-    if (effectiveName.length === 0) {
-      await conn.sendBytes(LocalSendServer.encodeResponse(400, '{"status":"missing-file"}'));
+    this.closeStream(stream);
+    session.activeFiles.delete(fileId);
+    session.receivedFiles.add(fileId);
+    try {
+      await conn.sendBytes(LocalSendServer.encodeResponse(200, '{"status":"ok"}'));
+    } finally {
+      this.reportReceived(stream, session, session.files.size === 1)
+        .catch((error: Error): void => this.failSession(sessionId, '保存接收文件失败：' + error.message));
+    }
+  }
+
+  /**
+   * 在「搬到下载目录」之前把沙箱副本交给上层（动态图片需要在这里把内容读完）。
+   * 上层失败/超时都不影响接收主流程，只记日志。
+   */
+  private async stageIncoming(sessionId: string, file: IncomingFile): Promise<void> {
+    if (this.handler === undefined) {
       return;
     }
-    const savedPath = await this.writeIncomingFile(effectiveName, fileData);
-    Lg.i('LocalSend upload saved: ' + effectiveName + ' (' + fileData.length + ' bytes) -> ' + savedPath);
-    session.receivedBytes += fileData.length;
-    session.expiresAt = Date.now() + SESSION_TTL_MS;
-    if (this.handler !== undefined) {
-      const progress = session.totalBytes > 0 ? session.receivedBytes / session.totalBytes * 100 : 100;
-      // 数据已写入但尚未 relocate 到最终目录，clamp 到 <100 以免提前触发 completed
-      // （与 chunked 路径一致），真正的完成交给下方 relocate 完成后的 onProgress(100)。
-      this.handler.onProgress(sessionId, Math.min(progress, 99.9));
+    try {
+      await this.handler.onFileStaged(sessionId, file);
+    } catch (error) {
+      Lg.w('LocalSend stage hook failed: ' + (error instanceof Error ? error.message : JSON.stringify(error)));
     }
-    if (session.receivedBytes >= session.totalBytes) {
-      this.sessions.delete(sessionId);
-    }
-    await conn.sendBytes(LocalSendServer.encodeResponse(200, '{"status":"ok"}'));
-    void this.relocateIncoming(savedPath, session.files.size === 1, effectiveName).then((finalPath: string): void => {
-      if (this.handler !== undefined) {
-        this.handler.onFileReceived(sessionId, { name: effectiveName, size: fileData.length, savedPath: finalPath });
-        this.handler.onProgress(sessionId, 100);
-      }
-    });
   }
 
   private openIncomingStream(fileName: string): OpenStreamResult {
@@ -1312,44 +1675,55 @@ export class LocalSendServer {
     if (!fs.accessSync(dir)) {
       fs.mkdirSync(dir, true);
     }
-    const sanitized = fileName.replace(/[\\/:*?"<>|]/g, '_');
-    let target = `${dir}/${sanitized}`;
-    if (fs.accessSync(target)) {
-      target = `${dir}/${Date.now()}-${sanitized}`;
+    const sanitized = GalleryMediaClassifier.safeFileName(fileName);
+    const dot = sanitized.lastIndexOf('.');
+    const stem = dot > 0 ? sanitized.substring(0, dot) : sanitized;
+    const ext = dot > 0 ? sanitized.substring(dot) : '';
+    for (let index = 0; index < 10000; index++) {
+      const target = dir + '/' + stem + (index === 0 ? '' : ' (' + index + ')') + ext;
+      if (!fs.accessSync(target)) {
+        return { file: fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE), path: target };
+      }
     }
-    const file = fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-    return { file, path: target };
+    throw new Error('无法分配不重名的接收文件');
   }
 
-  private tryOpenUploadStream(sessionId: string, fileId: string, token: string): StreamState | 'unauthorized' | 'error' {
+  private tryOpenUploadStream(sessionId: string, fileId: string, token: string): StreamState | 'unauthorized' | 'duplicate' | 'error' {
     const session = this.sessions.get(sessionId);
     if (session === undefined || session.token !== token) {
       Lg.w('LocalSend upload 401: session=' + (session === undefined ? 'missing' : 'token-mismatch') + ' id=' + sessionId);
       return 'unauthorized';
     }
     if (session.expiresAt <= Date.now()) {
-      this.sessions.delete(sessionId);
+      this.failSession(sessionId, '接收会话已超时');
       Lg.w('LocalSend upload rejected: session expired id=' + sessionId);
       return 'unauthorized';
     }
     const meta = session.files.get(fileId);
-    const name = meta !== undefined ? meta.name : fileId;
+    if (meta === undefined) {
+      return 'unauthorized';
+    }
+    if (session.activeFiles.has(fileId) || session.receivedFiles.has(fileId)) {
+      return 'duplicate';
+    }
+    const name = meta.name;
     try {
       const opened = this.openIncomingStream(name);
-      session.activeStreams += 1;
+      session.activeFiles.add(fileId);
       session.expiresAt = Date.now() + SESSION_TTL_MS;
       return {
         file: opened.file,
         path: opened.path,
         sessionId,
+        fileId,
         name,
+        mime: meta.mime,
         lastPct: -1,
         pos: 0,
         total: meta !== undefined ? meta.size : 0,
         received: 0,
-        chunkSize: -1,
-        waitingLine: false,
-        mpPhase: 0
+        chunkSize: 0,
+        chunkPhase: 0
       };
     } catch (error) {
       Lg.w('LocalSend stream open failed: ' + JSON.stringify(error));
@@ -1361,12 +1735,16 @@ export class LocalSendServer {
     if (data.length === 0) {
       return;
     }
-    fs.writeSync(stream.file.fd, ByteUtils.toArrayBuffer(data));
+    if (data.length > stream.total - stream.received) { throw new Error('接收数据超过声明大小'); }
+    const written: number = fs.writeSync(stream.file.fd, ByteUtils.toArrayBuffer(data));
+    if (written !== data.length) {
+      throw new Error('接收文件写入不完整');
+    }
     stream.received += data.length;
     session.receivedBytes += data.length;
     session.expiresAt = Date.now() + SESSION_TTL_MS;
-    const total = stream.total > 0 ? stream.total : session.totalBytes;
-    const capped = total > 0 ? Math.min(stream.received / total * 100, 100) : 100;
+    const total = session.totalBytes;
+    const capped = total > 0 ? Math.min(session.receivedBytes / total * 100, 100) : 100;
     const pct = Math.floor(capped);
     if (pct !== stream.lastPct) {
       stream.lastPct = pct;
@@ -1378,17 +1756,52 @@ export class LocalSendServer {
   }
 
   private async reportReceived(stream: StreamState, session: SessionState, allowPrompt: boolean): Promise<void> {
-    const finalPath = await this.relocateIncoming(stream.path, allowPrompt);
+    await this.reportSaved(stream, session, allowPrompt);
+  }
+
+  private async reportSaved(stream: StreamState, session: SessionState, allowPrompt: boolean): Promise<void> {
+    if (session.failed) { return; }
+    const sessionId = stream.sessionId;
+    const name = stream.name;
+    const path = stream.path;
+    const size = stream.received;
+    // 先让上层读沙箱副本（动态图片解析），再搬到下载目录 —— 搬运会删除沙箱源文件。
+    await this.stageIncoming(sessionId, { name, size, savedPath: path, mime: stream.mime });
+    const finalPath = await this.relocateIncoming(path, allowPrompt, name);
+    if (session.failed) {
+      return;
+    }
+    session.savedFiles.add(stream.fileId);
     if (this.handler !== undefined) {
-      this.handler.onFileReceived(stream.sessionId, { name: stream.name, size: stream.received, savedPath: finalPath });
-      this.handler.onProgress(stream.sessionId, 100);
+      this.handler.onFileReceived(sessionId,
+        { name, size, savedPath: finalPath, localPath: path, mime: stream.mime });
+      this.handler.onProgress(sessionId,
+        session.savedFiles.size === session.files.size ? 100 :
+          Math.min(99.9, session.totalBytes > 0 ? session.receivedBytes / session.totalBytes * 100
+            : session.savedFiles.size / session.files.size * 100));
+    }
+    if (session.savedFiles.size === session.files.size) {
+      this.sessions.delete(sessionId);
     }
   }
 
   private async relocateIncoming(srcPath: string, allowPrompt: boolean, preferredName: string = ''): Promise<string> {
     Lg.i('LocalSend receive relocate: src=' + srcPath + ' allowPrompt=' + allowPrompt);
     const slash = srcPath.lastIndexOf('/');
-    const name = preferredName.length > 0 ? preferredName : (slash >= 0 ? srcPath.substring(slash + 1) : srcPath);
+    const name = GalleryMediaClassifier.safeFileName(
+      preferredName.length > 0 ? preferredName : (slash >= 0 ? srcPath.substring(slash + 1) : srcPath));
+    const galleryUri: string = GalleryAutoSaveService.galleryUriForSourcePath(srcPath);
+    if (galleryUri.length > 0) {
+      LocalSendServer.removePartial(srcPath);
+      Lg.i('LocalSend receive relocate: already in gallery, return asset uri: ' + galleryUri);
+      return galleryUri;
+    }
+    // 设置「动态图片/HDR图片不保存至下载文件夹」：已经处理成相册动态照片的文件不再放副本，
+    // 直接留在沙箱（相册里已经是移动照片，下载目录再存一份原始文件属重复）。
+    if (!DynamicPhotoService.shouldKeepDownloadCopy(srcPath)) {
+      Lg.i('LocalSend receive relocate: skipped by setting (kept in sandbox): ' + name);
+      return srcPath;
+    }
     try {
       const silentDest = await this.trySilentDownload(srcPath, name);
       if (silentDest.length > 0) {
@@ -1455,7 +1868,7 @@ export class LocalSendServer {
         return cand;
       }
     }
-    return first;
+    throw new Error('无法分配不重名的下载文件');
   }
 
   private async trySilentDownload(srcPath: string, name: string): Promise<string> {
@@ -1471,25 +1884,21 @@ export class LocalSendServer {
       folder = uris[0] ?? '';
       LocalSendServer.downloadDirUri = folder;
     }
-    const sep = folder.endsWith('/') ? '' : '/';
     const dest = this.uniqueDestination(folder, name);
     Lg.i('LocalSend receive relocate: silent dest=' + dest);
     let srcFd = -1;
     let dstFd = -1;
+    let created = false;
     try {
       srcFd = fs.openSync(srcPath, fs.OpenMode.READ_ONLY).fd;
       dstFd = fs.openSync(dest, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE).fd;
-      const buf = new ArrayBuffer(1024 * 1024);
-      let n = fs.readSync(srcFd, buf);
-      while (n > 0) {
-        fs.writeSync(dstFd, buf.slice(0, n));
-        n = fs.readSync(srcFd, buf);
-      }
+      created = true;
+      LocalSendServer.copyVerified(srcFd, dstFd);
       fs.closeSync(srcFd);
       srcFd = -1;
       fs.closeSync(dstFd);
       dstFd = -1;
-      fs.unlinkSync(srcPath);
+      LocalSendServer.removePartial(srcPath);
       Lg.i('LocalSend receive relocated: ' + srcPath + ' -> ' + dest);
       return dest;
     } catch (error) {
@@ -1508,6 +1917,7 @@ export class LocalSendServer {
       } catch (closeError) {
         Lg.w('LocalSend receive relocate dst close failed: ' + JSON.stringify(closeError));
       }
+      if (created) { LocalSendServer.removePartial(dest); }
       return '';
     }
   }
@@ -1530,17 +1940,12 @@ export class LocalSendServer {
       Lg.i('LocalSend receive relocate: picker dest=' + dest);
       srcFd = fs.openSync(srcPath, fs.OpenMode.READ_ONLY).fd;
       dstFd = fs.openSync(dest, fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC).fd;
-      const buf = new ArrayBuffer(1024 * 1024);
-      let n = fs.readSync(srcFd, buf);
-      while (n > 0) {
-        fs.writeSync(dstFd, buf.slice(0, n));
-        n = fs.readSync(srcFd, buf);
-      }
+      LocalSendServer.copyVerified(srcFd, dstFd);
       fs.closeSync(srcFd);
       srcFd = -1;
       fs.closeSync(dstFd);
       dstFd = -1;
-      fs.unlinkSync(srcPath);
+      LocalSendServer.removePartial(srcPath);
       Lg.i('LocalSend receive relocated: ' + srcPath + ' -> ' + dest);
       return dest;
     } catch (error) {
@@ -1562,6 +1967,24 @@ export class LocalSendServer {
       return '';
     }
   }
+  private static copyVerified(source: number, target: number): void {
+    const expected = fs.statSync(source).size;
+    const buffer = new ArrayBuffer(1024 * 1024);
+    let copied = 0;
+    while (copied < expected) {
+      const count = fs.readSync(source, buffer, { length: Math.min(buffer.byteLength, expected - copied) });
+      if (count <= 0) { throw new Error('源文件未完整读取'); }
+      let written = 0;
+      while (written < count) {
+        const delta = fs.writeSync(target, buffer.slice(written, count));
+        if (delta <= 0 || delta > count - written) { throw new Error('目标文件未完整写入'); }
+        written += delta;
+      }
+      copied += count;
+    }
+    if (fs.statSync(target).size !== expected) { throw new Error('目标文件长度与源文件不符'); }
+  }
+
   private closeStream(state: StreamState): void {
     try {
       fs.closeSync(state.file);
@@ -1570,163 +1993,66 @@ export class LocalSendServer {
     }
   }
 
-  private consumeChunked(buffer: Uint8Array, state: StreamState): number {
+  private consumeChunked(buffer: Uint8Array, state: StreamState, session: SessionState): number {
     while (true) {
-      if (state.chunkSize < 0) {
-        const lineEnd = ByteUtils.indexOf(buffer, CRLF, state.pos);
-        if (lineEnd < 0) {
-          return 0;
-        }
-        const sizeText = ByteUtils.decodeText(buffer.slice(state.pos, lineEnd));
-        const semi = sizeText.indexOf(';');
-        const sizeHex = (semi >= 0 ? sizeText.substring(0, semi) : sizeText).trim();
-        const size = parseInt(sizeHex, 16);
-        if (Number.isNaN(size)) {
-          if (!state.waitingLine) {
-            state.waitingLine = true;
-            Lg.w('LocalSend chunked: invalid size line (linePos=' + state.pos + ' lineLen=' + (lineEnd - state.pos) + ' chunkSize=' + state.chunkSize + ' received=' + state.received + ' bufLen=' + buffer.length + ')');
-          }
-          return -1;
-        }
-        state.pos = lineEnd + CRLF.length;
-        state.waitingLine = false;
+      if (state.chunkPhase === 0) { // size line
+        const end = ByteUtils.indexOf(buffer, CRLF, state.pos);
+        if (end < 0) { return buffer.length - state.pos > 1024 ? -1 : 0; }
+        if (end - state.pos > 1024) { return -1; }
+        const sizeText = ByteUtils.decodeText(buffer.slice(state.pos, end)).split(';')[0];
+        if (!/^[0-9a-fA-F]+$/.test(sizeText)) { return -1; }
+        const size = parseInt(sizeText, 16);
+        if (!Number.isSafeInteger(size) || size > state.total - state.received) { return -1; }
+        state.pos = end + 2;
         state.chunkSize = size;
-        if (size === 0) {
-          if (buffer.length < state.pos + CRLF.length || buffer[state.pos] !== CRLF[0] || buffer[state.pos + 1] !== CRLF[1]) {
-            return 0;
-          }
-          state.pos += CRLF.length;
-          return 1;
-        }
+        state.chunkPhase = size > 0 ? 1 : 3;
       }
-      const needEnd = state.pos + state.chunkSize + CRLF.length;
-      if (buffer.length < needEnd) {
-        return 0;
+      if (state.chunkPhase === 1) { // body bytes, possibly spread over many packets
+        const count = Math.min(state.chunkSize, buffer.length - state.pos);
+        if (count <= 0) { return 0; }
+        this.writeRawData(session, state, buffer.slice(state.pos, state.pos + count));
+        state.pos += count;
+        state.chunkSize -= count;
+        if (state.chunkSize > 0) { return 0; }
+        state.chunkPhase = 2;
       }
-      const data = buffer.slice(state.pos, state.pos + state.chunkSize);
-      fs.writeSync(state.file.fd, ByteUtils.toArrayBuffer(data));
-      state.received += data.length;
-      const chTotal = state.total > 0 ? state.total : 0;
-      const rawProgress = chTotal > 0 ? state.received / chTotal * 100 : 100;
-      const capped = Math.min(rawProgress, 100);
-      const pct = Math.floor(capped);
-      if (pct !== state.lastPct) {
-        state.lastPct = pct;
-        Lg.i('LocalSend chunked progress: ' + state.received + '/' + chTotal + ' (' + pct + '%)');
-        if (this.handler !== undefined) {
-          // 数据已写完但尚未 relocate 到最终目录，此时不要把进度推到 100：否则会提前触发
-          // completed（receievedFiles 还没填充、sessionTasks 早删），后续 reportReceived
-          // 的 onFileReceived/onProgress(100) 会被 taskForSession 判空而丢弃，导致完成框缺
-          // 「打开」按钮、且被首次「保存位置」picker 遮挡。clamp 到 <100 让真正完成由
-          // reportReceived 的 onProgress(100) 在落盘后统一收尾。
-          this.handler.onProgress(state.sessionId, Math.min(capped, 99.9));
-        }
+      if (state.chunkPhase === 2) { // CRLF after nonempty data
+        if (buffer.length - state.pos < 2) { return 0; }
+        if (buffer[state.pos] !== 13 || buffer[state.pos + 1] !== 10) { return -1; }
+        state.pos += 2;
+        state.chunkPhase = 0;
+      } else if (state.chunkPhase === 3) { // trailer section; empty line always terminates it
+        if (buffer.length - state.pos < 2) { return 0; }
+        if (buffer[state.pos] === 13 && buffer[state.pos + 1] === 10) { return 1; }
+        const end = ByteUtils.indexOf(buffer, CRLF_CRLF, state.pos);
+        if (end < 0) { return buffer.length - state.pos > MAX_HEAD_BYTES ? -1 : 0; }
+        return end - state.pos > MAX_HEAD_BYTES ? -1 : 1;
       }
-      if (chTotal > 0 && state.received > chTotal) {
-        Lg.w('LocalSend chunked: overread received=' + state.received + ' total=' + chTotal);
-      }
-      state.pos += state.chunkSize + CRLF.length;
-      state.chunkSize = -1;
     }
   }
 
-  private consumeMultipart(buffer: Uint8Array, state: StreamState): number {
+  private consumeMultipart(buffer: Uint8Array, state: StreamState, session: SessionState): number {
     const delim = state.mpDelim;
-    if (delim === undefined || delim.length === 0) {
-      return -1;
+    if (delim === undefined) { return -1; }
+    // Each upload token authorizes exactly one file of a known size. Boundary-like
+    // bytes inside it are data. Only look for the form delimiter after that size.
+    const count = Math.min(state.total - state.received, buffer.length - state.pos);
+    if (count > 0) {
+      this.writeRawData(session, state, buffer.slice(state.pos, state.pos + count));
+      state.pos += count;
     }
-    while (true) {
-      if (state.mpPhase === 1) {
-        const idx = ByteUtils.indexOf(buffer, delim, state.pos);
-        if (idx < 0) {
-          const keep = delim.length - 1;
-          const writeEnd = Math.max(state.pos, buffer.length - keep);
-          if (writeEnd > state.pos) {
-            const session = this.sessions.get(state.sessionId);
-            if (session !== undefined) {
-              this.writeRawData(session, state, buffer.slice(state.pos, writeEnd));
-            }
-          }
-          state.pos = Math.min(writeEnd, buffer.length);
-          return 0;
-        }
-        let dataEnd = idx;
-        if (dataEnd >= state.pos + 2 && buffer[dataEnd - 2] === 13 && buffer[dataEnd - 1] === 10) {
-          dataEnd -= 2;
-        }
-        if (dataEnd > state.pos) {
-          const session = this.sessions.get(state.sessionId);
-          if (session !== undefined) {
-            this.writeRawData(session, state, buffer.slice(state.pos, dataEnd));
-          }
-        }
-        let p = idx + delim.length;
-        if (p + 2 > buffer.length) {
-          // 分隔符尾部（-- 或 CRLF）尚未到齐，等待更多数据后再判定，幂等重扫
-          state.pos = idx;
-          return 0;
-        }
-        if (buffer[p] === 0x2d && buffer[p + 1] === 0x2d) {
-          state.pos = p + 2;
-          return 1;
-        }
-        if (buffer[p] === 0x0d && buffer[p + 1] === 0x0a) {
-          p += 2;
-        }
-        state.pos = p;
-        state.mpPhase = 0;
-        continue;
-      }
-      const idx = ByteUtils.indexOf(buffer, delim, state.pos);
-      if (idx < 0) {
-        if (buffer.length - state.pos > MAX_MP_SCAN_BYTES) {
-          return -1;
-        }
-        return 0;
-      }
-      let p = idx + delim.length;
-      if (p + 2 > buffer.length) {
-        state.pos = idx;
-        return 0;
-      }
-      if (buffer[p] === 0x2d && buffer[p + 1] === 0x2d) {
-        state.pos = p + 2;
-        return 1;
-      }
-      if (buffer[p] === 0x0d && buffer[p + 1] === 0x0a) {
-        p += 2;
-      }
-      const headerEnd = ByteUtils.indexOf(buffer, CRLF_CRLF, p);
-      if (headerEnd < 0) {
-        if (buffer.length - p > MAX_MP_HEADER_BYTES) {
-          return -1;
-        }
-        return 0;
-      }
-      const headerText = ByteUtils.decodeText(buffer.slice(p, headerEnd));
-      const nameMatch = /name="([^"]*)"/.exec(headerText);
-      const name = nameMatch !== null ? nameMatch[1] : '';
-      if (name === 'file') {
-        state.pos = headerEnd + 4;
-        state.mpPhase = 1;
-        continue;
-      }
-      const next = ByteUtils.indexOf(buffer, delim, headerEnd + 4);
-      if (next < 0) {
-        return 0;
-      }
-      state.pos = next;
+    if (state.received !== state.total || buffer.length - state.pos < delim.length + 2) { return 0; }
+    for (let i = 0; i < delim.length; i++) {
+      if (buffer[state.pos + i] !== delim[i]) { return -1; }
     }
-  }
-
-  private async writeIncomingFile(fileName: string, data: Uint8Array): Promise<string> {
-    const opened = this.openIncomingStream(fileName);
-    try {
-      await fs.write(opened.file.fd, ByteUtils.toArrayBuffer(data));
-    } finally {
-      fs.closeSync(opened.file);
-    }
-    return opened.path;
+    const after = state.pos + delim.length;
+    if (buffer[after] === 45 && buffer[after + 1] === 45) { return 1; }
+    if (buffer[after] !== 13 || buffer[after + 1] !== 10) { return -1; }
+    // Older clients may append non-file form fields. Wait for the closing delimiter
+    // with a bounded buffer; never append the fields to the file.
+    const close = ByteUtils.concat([delim, new Uint8Array([45, 45])]);
+    if (ByteUtils.indexOf(buffer, close, after) >= 0) { return 1; }
+    return buffer.length - after > MAX_MP_SCAN_BYTES ? -1 : 0;
   }
 
   private static scanMultipartPart(buffer: Uint8Array, from: number, delim: Uint8Array, fields: MpScan): MpPartResult {
@@ -1810,14 +2136,17 @@ export class LocalSendServer {
   }
 
   private static readContentLength(headText: string): number {
-    const lines = headText.split('\r\n');
-    for (const line of lines) {
+    let length = -1;
+    for (const line of headText.split('\r\n')) {
       if (line.toLowerCase().startsWith('content-length:')) {
-        const value = parseInt(line.substring(15).trim(), 10);
-        return Number.isNaN(value) ? 0 : value;
+        const raw = line.substring(15).trim();
+        const value = Number(raw);
+        if (!/^[0-9]+$/.test(raw) || !Number.isSafeInteger(value) ||
+          (length >= 0 && length !== value)) { return -1; }
+        length = value;
       }
     }
-    return 0;
+    return Math.max(0, length);
   }
 
   private static isUploadPath(path: string): boolean {

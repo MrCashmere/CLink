@@ -46,12 +46,20 @@ const MAX_ENTRIES: number = 200;
 export class WindowsNearbyHistory {
   private static entries: WindowsNearbyHistoryEntry[] = [];
   private static loaded: boolean = false;
+  private static loading?: Promise<void>;
+  private static writes: Promise<void> = Promise.resolve();
 
   static async load(context: common.Context): Promise<void> {
     if (WindowsNearbyHistory.loaded) {
       return;
     }
-    WindowsNearbyHistory.loaded = true;
+    if (WindowsNearbyHistory.loading === undefined) {
+      WindowsNearbyHistory.loading = WindowsNearbyHistory.readStore(context);
+    }
+    await WindowsNearbyHistory.loading;
+  }
+
+  private static async readStore(context: common.Context): Promise<void> {
     try {
       const store = await dataPreferences.getPreferences(context, STORE_NAME);
       const raw = await store.get('entries', '[]');
@@ -67,9 +75,16 @@ export class WindowsNearbyHistory {
       Lg.w('WindowsNearbyHistory load failed: ' + JSON.stringify(error));
       WindowsNearbyHistory.entries = [];
     }
+    WindowsNearbyHistory.loaded = true;
   }
 
   static async add(context: common.Context, entry: WindowsNearbyHistoryEntry): Promise<void> {
+    WindowsNearbyHistory.writes = WindowsNearbyHistory.writes.then((): Promise<void> =>
+      WindowsNearbyHistory.addStored(context, entry));
+    await WindowsNearbyHistory.writes;
+  }
+
+  private static async addStored(context: common.Context, entry: WindowsNearbyHistoryEntry): Promise<void> {
     await WindowsNearbyHistory.load(context);
     WindowsNearbyHistory.entries = [entry].concat(WindowsNearbyHistory.entries).slice(0, MAX_ENTRIES);
     try {
@@ -86,6 +101,13 @@ export class WindowsNearbyHistory {
   }
 
   static async clear(context: common.Context): Promise<void> {
+    WindowsNearbyHistory.writes = WindowsNearbyHistory.writes.then((): Promise<void> =>
+      WindowsNearbyHistory.clearStored(context));
+    await WindowsNearbyHistory.writes;
+  }
+
+  private static async clearStored(context: common.Context): Promise<void> {
+    await WindowsNearbyHistory.load(context);
     WindowsNearbyHistory.entries = [];
     try {
       const store = await dataPreferences.getPreferences(context, STORE_NAME);
